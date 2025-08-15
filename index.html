@@ -59,18 +59,20 @@
     .risk-gauge{position:relative;width:100px;height:50px;margin:10px auto}
     .gauge-bg{width:100%;height:100%;border-radius:100px 100px 0 0;background:conic-gradient(from 180deg,#22c55e 0deg,#fbbf24 90deg,#ef4444 180deg)}
     .gauge-needle{position:absolute;bottom:0;left:50%;width:2px;height:40px;background:#fff;transform-origin:bottom;transition:transform .5s ease}
+    .api-status{font-size:.9rem;margin-top:10px}
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
       <h1>📊 TQQQ LRS 策略儀表板</h1>
-      <div class="subtitle">基於 "Leverage for the Long Run" 論文 - 系統性槓桿輪動策略</div>
+      <div class="subtitle">基於 "Leverage for the Long Run" 論文 - 系統性槓桿輪動策略 (Alpha Vantage API)</div>
       <div class="last-updated">
         <span id="lastUpdate">載入中...</span>
         <button class="refresh-btn" onclick="refreshData()">🔄 更新數據</button>
-        <span id="wsHealth" class="badge">WS 檢測中</span>
+        <span id="apiHealth" class="badge">API 檢測中</span>
       </div>
+      <div id="apiStatus" class="api-status"></div>
     </div>
 
     <div id="loadingIndicator" class="loading">正在載入市場數據和計算技術指標</div>
@@ -229,8 +231,8 @@
           <span id="leverageSuitability" class="metric-value">--/10</span>
         </div>
         <div class="metric">
-          <span class="metric-label">VIX 代理 (VIXY)</span>
-          <span id="vixLevel" class="metric-value">--</span>
+          <span class="metric-label">市場情緒指標</span>
+          <span id="marketSentiment" class="metric-value">--</span>
         </div>
         <div class="metric">
           <span class="metric-label">恐慌貪婪指數</span>
@@ -297,1048 +299,241 @@
   </div>
 
   <script>
-    // ====== Finnhub API 設定 ======
-    const FINNHUB_KEY = 'd2ev6o9r01qmrq4p164gd2ev6o9r01qmrq4p1650';
-    const FH_BASE = 'https://finnhub.io/api/v1';
-    const WS_URL = `wss://ws.finnhub.io?token=${encodeURIComponent(FINNHUB_KEY)}`;
+    // ====== Alpha Vantage API 設定 ======
+    const ALPHA_VANTAGE_KEY = 'J8WGSIJ73G3YAPGG';
+    const AV_BASE = 'https://www.alphavantage.co/query';
+    
+    // 請求速率限制管理
+    let lastRequestTime = 0;
+    const REQUEST_INTERVAL = 12000; // 12秒間隔，確保不超過 5 requests/minute
+
+    async function rateLimitedFetch(url) {
+      const now = Date.now();
+      const timeSinceLastRequest = now - lastRequestTime;
+      
+      if (timeSinceLastRequest < REQUEST_INTERVAL) {
+        await new Promise(resolve => setTimeout(resolve, REQUEST_INTERVAL - timeSinceLastRequest));
+      }
+      
+      lastRequestTime = Date.now();
+      return fetch(url);
+    }
 
     // ====== 快取機制 ======
-    const LS_PREFIX = 'tqqq_lrs_enhanced_';
-    function cacheGet(k){
-      try{
-        const r=localStorage.getItem(LS_PREFIX+k);
-        if(!r) return null;
-        const o=JSON.parse(r);
-        if(o.exp && Date.now()>o.exp){
-          localStorage.removeItem(LS_PREFIX+k);
+    const CACHE_PREFIX = 'tqqq_lrs_av_';
+    const CACHE_DURATION = {
+      INTRADAY: 5 * 60 * 1000,    // 5 minutes for intraday
+      DAILY: 30 * 60 * 1000,      // 30 minutes for daily
+      QUOTE: 2 * 60 * 1000        // 2 minutes for quotes
+    };
+
+    function getCacheKey(symbol, function_name, outputsize = 'compact') {
+      return `${CACHE_PREFIX}${symbol}_${function_name}_${outputsize}`;
+    }
+
+    function getFromCache(key) {
+      try {
+        const cached = localStorage.getItem(key);
+        if (!cached) return null;
+        
+        const { data, timestamp } = JSON.parse(cached);
+        const age = Date.now() - timestamp;
+        
+        // 檢查快取是否過期
+        if (age > CACHE_DURATION.DAILY) {
+          localStorage.removeItem(key);
           return null;
         }
-        return o.val;
-      }catch{return null}
-    }
-    function cacheSet(k,v,ttl){
-      localStorage.setItem(LS_PREFIX+k,JSON.stringify({val:v,exp:ttl?Date.now()+ttl:0}));
-    }
-
-    async function fetchJSON(url, cacheKey=null, ttlMs=0){
-      if(cacheKey){
-        const c=cacheGet(cacheKey); 
-        if(c) return c;
+        
+        return data;
+      } catch (e) {
+        return null;
       }
-      const res = await fetch(url);
-      if(!res.ok) throw new Error('HTTP '+res.status);
-      const j = await res.json();
-      if(cacheKey && ttlMs) cacheSet(cacheKey,j,ttlMs);
-      return j;
     }
 
-    // ====== WebSocket 連線管理 ======
-    let ws=null, wsTimer=null, wsBackoff=2000, wsHealthy=false;
-    const subs = new Set(['QQQ','TQQQ','VIXY']);
-    const lastPrice = { QQQ: null, TQQQ: null, VIXY: null };
-    const prevClose = { QQQ: null, TQQQ: null, VIXY: null };
-
-    function setWSBadge(ok){
-      wsHealthy = ok;
-      const el = document.getElementById('wsHealth');
-      el.textContent = ok ? 'WS 即時' : 'WS 離線';
-      el.className = 'badge ' + (ok ? 'badge-ok' : 'badge-fail');
-    }
-
-    function openWS(){
-      try{
-        ws = new WebSocket(WS_URL);
-      }catch(e){
-        setWSBadge(false);
-        scheduleReconnect();
-        return;
+    function setCache(key, data, duration = CACHE_DURATION.DAILY) {
+      try {
+        const cacheData = {
+          data: data,
+          timestamp: Date.now()
+        };
+        localStorage.setItem(key, JSON.stringify(cacheData));
+      } catch (e) {
+        console.warn('無法設定快取:', e);
       }
-      ws.onopen = ()=>{
-        setWSBadge(true);
-        wsBackoff = 2000;
-        subs.forEach(s => ws.send(JSON.stringify({type:'subscribe', symbol:s})));
-      };
-      ws.onmessage = (ev)=>{
-        const msg = JSON.parse(ev.data);
-        if(msg.type==='trade' && Array.isArray(msg.data)){
-          msg.data.forEach(t=>{
-            const s = t.s;
-            const p = t.p;
-            if(lastPrice[s]===null || lastPrice[s]!==p){
-              lastPrice[s]=p;
-              if(s==='QQQ') updateLiveQuoteUI('QQQ', p);
-              if(s==='TQQQ') updateLiveQuoteUI('TQQQ', p);
-            }
-          });
-          document.getElementById('lastUpdate').textContent = new Date().toLocaleString('zh-TW');
+    }
+
+    // ====== Alpha Vantage API 呼叫函數 ======
+    async function getQuoteAV(symbol) {
+      const cacheKey = getCacheKey(symbol, 'GLOBAL_QUOTE');
+      const cached = getFromCache(cacheKey);
+      
+      if (cached) {
+        console.log(`使用快取數據: ${symbol}`);
+        return cached;
+      }
+
+      const url = `${AV_BASE}?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${ALPHA_VANTAGE_KEY}`;
+      
+      try {
+        const response = await rateLimitedFetch(url);
+        const data = await response.json();
+        
+        if (data['Error Message']) {
+          throw new Error(`Alpha Vantage Error: ${data['Error Message']}`);
         }
-      };
-      ws.onerror = ()=>{ setWSBadge(false); };
-      ws.onclose = ()=>{ setWSBadge(false); scheduleReconnect(); };
+        
+        if (data['Note']) {
+          throw new Error('API call frequency limit reached');
+        }
+
+        const quote = data['Global Quote'];
+        if (!quote) {
+          throw new Error('無效的報價數據');
+        }
+
+        const result = {
+          symbol: quote['01. symbol'],
+          price: parseFloat(quote['05. price']),
+          change: parseFloat(quote['09. change']),
+          changePercent: parseFloat(quote['10. change percent'].replace('%', '')),
+          previousClose: parseFloat(quote['08. previous close']),
+          open: parseFloat(quote['02. open']),
+          high: parseFloat(quote['03. high']),
+          low: parseFloat(quote['04. low']),
+          volume: parseInt(quote['06. volume'])
+        };
+
+        setCache(cacheKey, result, CACHE_DURATION.QUOTE);
+        return result;
+      } catch (error) {
+        console.error(`獲取 ${symbol} 報價失敗:`, error);
+        throw error;
+      }
     }
 
-    function scheduleReconnect(){
-      if(wsTimer) clearTimeout(wsTimer);
-      wsTimer = setTimeout(()=>openWS(), wsBackoff);
-      wsBackoff = Math.min(wsBackoff*1.8, 60000);
+    async function getDailyDataAV(symbol, outputsize = 'compact') {
+      const cacheKey = getCacheKey(symbol, 'TIME_SERIES_DAILY', outputsize);
+      const cached = getFromCache(cacheKey);
+      
+      if (cached) {
+        console.log(`使用快取日線數據: ${symbol}`);
+        return cached;
+      }
+
+      const url = `${AV_BASE}?function=TIME_SERIES_DAILY&symbol=${symbol}&outputsize=${outputsize}&apikey=${ALPHA_VANTAGE_KEY}`;
+      
+      try {
+        const response = await rateLimitedFetch(url);
+        const data = await response.json();
+        
+        if (data['Error Message']) {
+          throw new Error(`Alpha Vantage Error: ${data['Error Message']}`);
+        }
+        
+        if (data['Note']) {
+          throw new Error('API call frequency limit reached');
+        }
+
+        const timeSeries = data['Time Series (Daily)'];
+        if (!timeSeries) {
+          throw new Error('無效的日線數據');
+        }
+
+        const dates = [];
+        const opens = [];
+        const highs = [];
+        const lows = [];
+        const closes = [];
+        const volumes = [];
+
+        // 按日期排序
+        const sortedDates = Object.keys(timeSeries).sort();
+        
+        sortedDates.forEach(date => {
+          const dayData = timeSeries[date];
+          dates.push(date);
+          opens.push(parseFloat(dayData['1. open']));
+          highs.push(parseFloat(dayData['2. high']));
+          lows.push(parseFloat(dayData['3. low']));
+          closes.push(parseFloat(dayData['4. close']));
+          volumes.push(parseInt(dayData['5. volume']));
+        });
+
+        const result = { dates, opens, highs, lows, closes, volumes };
+        setCache(cacheKey, result, CACHE_DURATION.DAILY);
+        return result;
+      } catch (error) {
+        console.error(`獲取 ${symbol} 日線數據失敗:`, error);
+        throw error;
+      }
     }
 
     // ====== 技術指標計算函數 ======
-    function computeSMA(arr, win){ 
-      if(arr.length<win) return null; 
-      const s=arr.slice(-win).reduce((a,b)=>a+b,0); 
-      return s/win;
+    function computeSMA(arr, win) { 
+      if (arr.length < win) return null; 
+      const s = arr.slice(-win).reduce((a, b) => a + b, 0); 
+      return s / win;
     }
 
-    function computeATR(highs, lows, closes, period=20){
-      if(closes.length < period+1) return null;
+    function computeATR(highs, lows, closes, period = 20) {
+      if (closes.length < period + 1) return null;
       const trueRanges = [];
-      for(let i=1; i<closes.length; i++){
+      for (let i = 1; i < closes.length; i++) {
         const tr = Math.max(
           highs[i] - lows[i],
-          Math.abs(highs[i] - closes[i-1]),
-          Math.abs(lows[i] - closes[i-1])
+          Math.abs(highs[i] - closes[i - 1]),
+          Math.abs(lows[i] - closes[i - 1])
         );
         trueRanges.push(tr);
       }
-      const atr = trueRanges.slice(-period).reduce((a,b)=>a+b,0) / period;
-      return (atr / closes[closes.length-1]) * 100; // 以百分比表示
+      const atr = trueRanges.slice(-period).reduce((a, b) => a + b, 0) / period;
+      return (atr / closes[closes.length - 1]) * 100;
     }
 
-    function computeVolatility(prices, period=20){
-      if(prices.length < period+1) return null;
+    function computeVolatility(prices, period = 20) {
+      if (prices.length < period + 1) return null;
       const returns = [];
-      for(let i=1; i<=period; i++){
-        const ret = (prices[prices.length-i] - prices[prices.length-i-1]) / prices[prices.length-i-1];
+      for (let i = 1; i <= period; i++) {
+        const ret = (prices[prices.length - i] - prices[prices.length - i - 1]) / prices[prices.length - i - 1];
         returns.push(ret);
       }
-      const mean = returns.reduce((a,b)=>a+b,0) / returns.length;
-      const variance = returns.reduce((a,b)=>a+Math.pow(b-mean,2),0) / (returns.length-1);
-      return Math.sqrt(variance) * Math.sqrt(252) * 100; // 年化波動率
+      const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+      const variance = returns.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / (returns.length - 1);
+      return Math.sqrt(variance) * Math.sqrt(252) * 100;
     }
 
-    function computeStreakAnalysis(prices, sma200Array){
-      if(prices.length < 20 || sma200Array.length < 20) return null;
+    function computeStreakAnalysis(prices, sma200Array) {
+      if (prices.length < 20 || sma200Array.length < 20) return null;
       
       const recent20 = [];
-      for(let i=prices.length-20; i<prices.length; i++){
-        if(i > 0 && sma200Array[i]){
-          const isUp = prices[i] > prices[i-1];
+      for (let i = prices.length - 20; i < prices.length; i++) {
+        if (i > 0 && sma200Array[i]) {
+          const isUp = prices[i] > prices[i - 1];
           const isAboveSMA = prices[i] > sma200Array[i];
-          recent20.push({isUp, isAboveSMA});
+          recent20.push({ isUp, isAboveSMA });
         }
       }
       
       let currentStreak = 0;
       let streakType = null;
-      for(let i=recent20.length-1; i>=0; i--){
-        if(streakType === null){
+      for (let i = recent20.length - 1; i >= 0; i--) {
+        if (streakType === null) {
           streakType = recent20[i].isUp ? 'up' : 'down';
           currentStreak = 1;
-        } else if((streakType === 'up' && recent20[i].isUp) || 
-                  (streakType === 'down' && !recent20[i].isUp)){
+        } else if ((streakType === 'up' && recent20[i].isUp) || 
+                  (streakType === 'down' && !recent20[i].isUp)) {
           currentStreak++;
         } else {
           break;
         }
       }
       
-      const aboveSMACount = recent20.filter(d=>d.isAboveSMA).length;
-      const upInTrendCount = recent20.filter(d=>d.isAboveSMA && d.isUp).length;
+      const aboveSMACount = recent20.filter(d => d.isAboveSMA).length;
+      const upInTrendCount = recent20.filter(d => d.isAboveSMA && d.isUp).length;
       const upStreakProb = aboveSMACount > 0 ? (upInTrendCount / aboveSMACount * 100) : 0;
       
       return {
         currentStreak: currentStreak + (streakType === 'up' ? '日上漲' : '日下跌'),
         upStreakProb: upStreakProb.toFixed(1),
         pattern: recent20.map(d => d.isUp ? 'up' : 'down'),
-        aboveSMADays: aboveSMACount
-      };
-    }
-
-    function computeLeverageEfficiency(qqqReturns, tqqqReturns, period=20){
-      if(qqqReturns.length < period || tqqqReturns.length < period) return null;
-      
-      const recentQQQ = qqqReturns.slice(-period);
-      const recentTQQQ = tqqqReturns.slice(-period);
-      
-      let efficiency = 0;
-      let validDays = 0;
-      
-      for(let i=0; i<recentQQQ.length; i++){
-        if(Math.abs(recentQQQ[i]) > 0.001){ // 避免除零
-          const expectedTQQQ = recentQQQ[i] * 3;
-          const actualRatio = recentTQQQ[i] / recentQQQ[i];
-          efficiency += actualRatio;
-          validDays++;
-        }
-      }
-      
-      return validDays > 0 ? (efficiency / validDays) : 3;
-    }
-
-    // ====== 市場數據獲取 ======
-    async function getDailyCandles(symbol, days=500){
-      const to = Math.floor(Date.now()/1000);
-      const from = to - Math.floor(days*24*60*60*1.2);
-      const url = `${FH_BASE}/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=D&from=${from}&to=${to}&token=${encodeURIComponent(FINNHUB_KEY)}`;
-      const j = await fetchJSON(url, `candle_${symbol}`, 30*60*1000); // 30分鐘快取
-      
-      if(j.s!=='ok') throw new Error('No candle data: '+symbol);
-      
-      return {
-        dates: j.t.map(ts => new Date(ts*1000).toISOString().slice(0,10)),
-        opens: j.o,
-        highs: j.h,
-        lows: j.l,
-        closes: j.c,
-        volumes: j.v
-      };
-    }
-
-    async function getQuote(symbol){
-      const url = `${FH_BASE}/quote?symbol=${encodeURIComponent(symbol)}&token=${encodeURIComponent(FINNHUB_KEY)}`;
-      const j = await fetchJSON(url, `quote_${symbol}`, 5*60*1000); // 5分鐘快取
-      return { 
-        price: j.c||0, 
-        changePct: j.dp||0, 
-        prevClose: j.pc||0, 
-        high: j.h||0,
-        low: j.l||0,
-        ts: j.t ? new Date(j.t*1000) : new Date() 
-      };
-    }
-
-    // ====== 主要分析函數 ======
-    async function fetchMarketData(){
-      // 獲取基本報價
-      const [qQQQ, qTQQQ, qVIXY] = await Promise.all([
-        getQuote('QQQ'), 
-        getQuote('TQQQ'), 
-        getQuote('VIXY')
-      ]);
-      
-      prevClose.QQQ = qQQQ.prevClose; 
-      prevClose.TQQQ = qTQQQ.prevClose; 
-      prevClose.VIXY = qVIXY.prevClose;
-
-      // 獲取歷史數據
-      const [dQQQ, dTQQQ] = await Promise.all([
-        getDailyCandles('QQQ', 500), 
-        getDailyCandles('TQQQ', 300)
-      ]);
-
-      // 計算技術指標
-      const qqqSMA200 = computeSMA(dQQQ.closes, 200);
-      const qqqSMA50 = computeSMA(dQQQ.closes, 50);
-      const qqqATR = computeATR(dQQQ.highs, dQQQ.lows, dQQQ.closes, 20);
-      
-      // 波動率分析（論文核心）
-      const currentVol = computeVolatility(dQQQ.closes, 20);
-      const trendVol = computeTrendVolatility(dQQQ.closes, 200);
-      const nonTrendVol = computeNonTrendVolatility(dQQQ.closes, 200);
-      
-      // 連續性能分析
-      const sma200Array = [];
-      for(let i=0; i<dQQQ.closes.length; i++){
-        sma200Array.push(computeSMA(dQQQ.closes.slice(0, i+1), 200));
-      }
-      const streakAnalysis = computeStreakAnalysis(dQQQ.closes, sma200Array);
-      
-      // 槓桿效率分析
-      const qqqReturns = [];
-      const tqqqReturns = [];
-      for(let i=1; i<Math.min(dQQQ.closes.length, dTQQQ.closes.length); i++){
-        qqqReturns.push((dQQQ.closes[i] - dQQQ.closes[i-1]) / dQQQ.closes[i-1]);
-        tqqqReturns.push((dTQQQ.closes[i] - dTQQQ.closes[i-1]) / dTQQQ.closes[i-1]);
-      }
-      const leverageEff = computeLeverageEfficiency(qqqReturns, tqqqReturns, 20);
-      
-      // 策略計算
-      const strategy = computeStrategyPerformance(dQQQ.closes, sma200Array);
-      
-      // 當前價格
-      lastPrice.QQQ = qQQQ.price || dQQQ.closes.at(-1);
-      lastPrice.TQQQ = qTQQQ.price || dTQQQ.closes.at(-1);
-      lastPrice.VIXY = qVIXY.price;
-
-      const isAbove = qqqSMA200 ? lastPrice.QQQ > qqqSMA200 : null;
-      const distance = qqqSMA200 ? ((lastPrice.QQQ - qqqSMA200)/qqqSMA200*100) : null;
-      
-      // 風險評估
-      const riskAssessment = assessRiskFactors(currentVol, qVIXY.price, distance);
-      
-      return {
-        lastUpdate: new Date().toLocaleString('zh-TW'),
-        qqq: {
-          price: (lastPrice.QQQ||0).toFixed(2),
-          change: qQQQ.changePct?.toFixed?.(2) ?? '--',
-          sma200: qqqSMA200 ? qqqSMA200.toFixed(2) : '--',
-          distance: distance ? distance.toFixed(2) : '--',
-          atr: qqqATR ? qqqATR.toFixed(2) : '--',
-          isAboveSma: !!isAbove
-        },
-        tqqq: {
-          price: (lastPrice.TQQQ||0).toFixed(2),
-          change: (qTQQQ.changePct??0).toFixed(2),
-          leverageEfficiency: leverageEff ? (leverageEff * 100).toFixed(1) : '--',
-          beta: calculateBeta(qqqReturns, tqqqReturns)
-        },
-        volatility: {
-          current: currentVol ? currentVol.toFixed(1) : '--',
-          inTrend: trendVol ? trendVol.toFixed(1) : '--',
-          outTrend: nonTrendVol ? nonTrendVol.toFixed(1) : '--',
-          position: currentVol ? Math.min(100, (currentVol / 50) * 100) : 0
-        },
-        streak: streakAnalysis || {
-          currentStreak: '--',
-          upStreakProb: '--',
-          pattern: [],
-          aboveSMADays: 0
-        },
-        strategy: strategy,
-        risk: riskAssessment,
-        signal: isAbove ? 'TQQQ' : 'CASH',
-        signalStrength: calculateSignalStrength(distance, currentVol),
-        historicalData: prepareChartData(dQQQ, sma200Array)
-      };
-    }
-
-    function computeTrendVolatility(prices, smaPeriod){
-      if(prices.length < smaPeriod + 50) return null;
-      
-      const trendPeriods = [];
-      for(let i=smaPeriod; i<prices.length-1; i++){
-        const sma = computeSMA(prices.slice(0, i+1), smaPeriod);
-        if(sma && prices[i] > sma){
-          const ret = (prices[i+1] - prices[i]) / prices[i];
-          trendPeriods.push(ret);
-        }
-      }
-      
-      if(trendPeriods.length < 10) return null;
-      const mean = trendPeriods.reduce((a,b)=>a+b,0) / trendPeriods.length;
-      const variance = trendPeriods.reduce((a,b)=>a+Math.pow(b-mean,2),0) / (trendPeriods.length-1);
-      return Math.sqrt(variance) * Math.sqrt(252) * 100;
-    }
-
-    function computeNonTrendVolatility(prices, smaPeriod){
-      if(prices.length < smaPeriod + 50) return null;
-      
-      const nonTrendPeriods = [];
-      for(let i=smaPeriod; i<prices.length-1; i++){
-        const sma = computeSMA(prices.slice(0, i+1), smaPeriod);
-        if(sma && prices[i] <= sma){
-          const ret = (prices[i+1] - prices[i]) / prices[i];
-          nonTrendPeriods.push(ret);
-        }
-      }
-      
-      if(nonTrendPeriods.length < 10) return null;
-      const mean = nonTrendPeriods.reduce((a,b)=>a+b,0) / nonTrendPeriods.length;
-      const variance = nonTrendPeriods.reduce((a,b)=>a+Math.pow(b-mean,2),0) / (nonTrendPeriods.length-1);
-      return Math.sqrt(variance) * Math.sqrt(252) * 100;
-    }
-
-    function calculateBeta(qqqReturns, tqqqReturns, period=60){
-      if(qqqReturns.length < period || tqqqReturns.length < period) return '--';
-      
-      const recentQQQ = qqqReturns.slice(-period);
-      const recentTQQQ = tqqqReturns.slice(-period);
-      
-      const meanQQQ = recentQQQ.reduce((a,b)=>a+b,0) / recentQQQ.length;
-      const meanTQQQ = recentTQQQ.reduce((a,b)=>a+b,0) / recentTQQQ.length;
-      
-      let covariance = 0;
-      let variance = 0;
-      
-      for(let i=0; i<recentQQQ.length; i++){
-        covariance += (recentQQQ[i] - meanQQQ) * (recentTQQQ[i] - meanTQQQ);
-        variance += Math.pow(recentQQQ[i] - meanQQQ, 2);
-      }
-      
-      return variance > 0 ? (covariance / variance).toFixed(2) : '--';
-    }
-
-    function computeStrategyPerformance(prices, sma200Array){
-      if(prices.length < 200 || sma200Array.length < 200) return null;
-      
-      let strategyValue = 1000; // 起始值
-      let buyHoldValue = 1000;
-      let inPosition = false;
-      let trades = 0;
-      let wins = 0;
-      let maxDD = 0;
-      let peak = 1000;
-      
-      const returns = [];
-      const dailyReturns = [];
-      
-      for(let i=200; i<prices.length-1; i++){
-        const isAboveSMA = sma200Array[i] && prices[i] > sma200Array[i];
-        const dailyReturn = (prices[i+1] - prices[i]) / prices[i];
-        
-        // 買入持有策略
-        buyHoldValue *= (1 + dailyReturn);
-        
-        // LRS 策略
-        if(isAboveSMA && !inPosition){
-          inPosition = true;
-          trades++;
-        } else if(!isAboveSMA && inPosition){
-          inPosition = false;
-        }
-        
-        if(inPosition){
-          const leveragedReturn = dailyReturn * 3; // 3x 槓桿
-          strategyValue *= (1 + leveragedReturn);
-          dailyReturns.push(leveragedReturn);
-        } else {
-          const riskFreeReturn = 0.0001; // 假設無風險利率
-          strategyValue *= (1 + riskFreeReturn);
-          dailyReturns.push(riskFreeReturn);
-        }
-        
-        // 計算最大回撤
-        if(strategyValue > peak) peak = strategyValue;
-        const drawdown = (peak - strategyValue) / peak;
-        if(drawdown > maxDD) maxDD = drawdown;
-        
-        returns.push(strategyValue);
-      }
-      
-      // 計算績效指標
-      const annualReturn = Math.pow(strategyValue / 1000, 252 / dailyReturns.length) - 1;
-      const volatility = computeVolatility(returns.map((v,i) => i>0 ? v/returns[i-1] : 1), dailyReturns.length);
-      const sharpeRatio = volatility > 0 ? (annualReturn * 100) / volatility : 0;
-      
-      // 計算 Sortino 比率
-      const downReturns = dailyReturns.filter(r => r < 0);
-      const downVol = downReturns.length > 0 ? 
-        Math.sqrt(downReturns.reduce((a,b)=>a+b*b,0) / downReturns.length) * Math.sqrt(252) * 100 : 0;
-      const sortinoRatio = downVol > 0 ? (annualReturn * 100) / downVol : 0;
-      
-      return {
-        annualReturn: (annualReturn * 100).toFixed(1),
-        sharpeRatio: sharpeRatio.toFixed(2),
-        sortinoRatio: sortinoRatio.toFixed(2),
-        maxDrawdown: (maxDD * 100).toFixed(1),
-        alpha: ((annualReturn - 0.1) * 100).toFixed(1), // 假設市場報酬 10%
-        avgTrades: Math.round(trades / (dailyReturns.length / 252))
-      };
-    }
-
-    function assessRiskFactors(volatility, vixPrice, distance){
-      const vol = parseFloat(volatility) || 0;
-      const vix = parseFloat(vixPrice) || 0;
-      const dist = Math.abs(parseFloat(distance) || 0);
-      
-      // 槓桿陷阱風險評估
-      let leverageTrapRisk = '低';
-      if(vol > 40) leverageTrapRisk = '高';
-      else if(vol > 25) leverageTrapRisk = '中';
-      
-      // 破產風險評估
-      let ruinRisk = '低';
-      if(vol > 50 && vix > 30) ruinRisk = '高';
-      else if(vol > 35 || vix > 25) ruinRisk = '中';
-      
-      // 槓桿適用性評分 (1-10)
-      let suitability = 8;
-      if(vol > 40) suitability -= 4;
-      else if(vol > 25) suitability -= 2;
-      if(vix > 30) suitability -= 2;
-      else if(vix > 20) suitability -= 1;
-      if(dist < 2) suitability -= 1; // 太接近均線
-      
-      // 建議最大槓桿
-      let maxLeverage = '3.0';
-      if(vol > 40) maxLeverage = '1.5';
-      else if(vol > 30) maxLeverage = '2.0';
-      else if(vol > 20) maxLeverage = '2.5';
-      
-      return {
-        leverageTrapRisk,
-        pathDependencyRisk: vol > 30 ? '高' : vol > 20 ? '中' : '低',
-        ruinRisk,
-        suitability: Math.max(1, Math.min(10, suitability)),
-        maxLeverage,
-        stopLoss: dist > 5 ? '無需要' : '考慮 -15%',
-        economicCycle: vix < 20 ? '擴張期' : vix < 30 ? '不確定' : '收縮期',
-        fearGreed: vix < 15 ? '貪婪' : vix < 25 ? '中性' : '恐慌'
-      };
-    }
-
-    function calculateSignalStrength(distance, volatility){
-      const dist = Math.abs(parseFloat(distance) || 0);
-      const vol = parseFloat(volatility) || 0;
-      
-      let strength = '中等';
-      if(dist > 5 && vol < 20) strength = '強';
-      else if(dist > 3 && vol < 25) strength = '較強';
-      else if(dist < 1 || vol > 35) strength = '弱';
-      
-      return strength;
-    }
-
-    function prepareChartData(dQQQ, sma200Array){
-      const n = Math.min(90, dQQQ.dates.length);
-      const data = [];
-      
-      for(let i=dQQQ.dates.length - n; i<dQQQ.dates.length; i++){
-        data.push({
-          date: dQQQ.dates[i],
-          price: dQQQ.closes[i],
-          sma200: sma200Array[i],
-          signal: sma200Array[i] && dQQQ.closes[i] > sma200Array[i] ? 'TQQQ' : 'CASH'
-        });
-      }
-      
-      return data;
-    }
-
-    // ====== UI 更新函數 ======
-    function updateLiveQuoteUI(symbol, price, givenPrevClose){
-      const pc = givenPrevClose ?? prevClose[symbol] ?? null;
-      if(symbol==='QQQ'){
-        document.getElementById('qqqPrice').textContent = ' + (price?.toFixed(2) ?? '--');
-        if(pc){
-          const chg = ((price-pc)/pc*100);
-          document.getElementById('qqqChange').textContent = (isFinite(chg)? chg.toFixed(2): '--') + '%';
-          document.getElementById('qqqChange').className = 'metric-value ' + (chg>=0?'positive':'negative');
-        }
-      }
-      if(symbol==='TQQQ'){
-        document.getElementById('tqqqPrice').textContent = ' + (price?.toFixed(2) ?? '--');
-      }
-    }
-
-    function updateDashboard(data){
-      document.getElementById('lastUpdate').textContent = data.lastUpdate;
-
-      // 核心信號
-      const isTQQQ = data.signal==='TQQQ';
-      const signalEl = document.getElementById('signalStatus');
-      signalEl.className='signal-status ' + (isTQQQ? 'signal-tqqq':'signal-cash');
-      signalEl.textContent = isTQQQ? '持有 TQQQ':'持有 現金';
-      document.getElementById('signalDescription').textContent = isTQQQ? 
-        'QQQ 在 200日均線之上，低波動環境，適合槓桿投資' : 
-        'QQQ 在 200日均線之下，高波動環境，規避槓桿陷阱';
-      document.getElementById('signalStrength').textContent = data.signalStrength;
-
-      // QQQ 基礎指標
-      document.getElementById('qqqPrice').textContent = '+data.qqq.price;
-      document.getElementById('qqqSma200').textContent = data.qqq.sma200==='--'?'--':('+data.qqq.sma200);
-      document.getElementById('qqqDistance').textContent = data.qqq.distance==='--'?'--':(data.qqq.distance+'%');
-      document.getElementById('qqqDistance').className = 'metric-value ' + 
-        (parseFloat(data.qqq.distance)>=0?'positive':'negative');
-      document.getElementById('qqqChange').textContent = (data.qqq.change||'0')+'%';
-      document.getElementById('qqqChange').className = 'metric-value ' + 
-        ((parseFloat(data.qqq.change)||0)>=0?'positive':'negative');
-      document.getElementById('qqqAtr').textContent = data.qqq.atr==='--'?'--':(data.qqq.atr+'%');
-
-      // 波動率分析
-      document.getElementById('currentVolatility').textContent = data.volatility.current==='--'?'--':(data.volatility.current+'%');
-      document.getElementById('trendVolatility').textContent = data.volatility.inTrend==='--'?'--':(data.volatility.inTrend+'%');
-      document.getElementById('nonTrendVolatility').textContent = data.volatility.outTrend==='--'?'--':(data.volatility.outTrend+'%');
-      
-      // 波動率指示器
-      const volIndicator = document.getElementById('volatilityIndicator');
-      volIndicator.style.left = data.volatility.position + '%';
-
-      // 連續表現分析
-      document.getElementById('currentStreak').textContent = data.streak.currentStreak;
-      document.getElementById('upStreakProb').textContent = data.streak.upStreakProb==='--'?'--':(data.streak.upStreakProb+'%');
-      document.getElementById('recentPattern').textContent = 
-        data.streak.aboveSMADays > 10 ? '趨勢向上' : 
-        data.streak.aboveSMADays < 5 ? '趨勢向下' : '盤整格局';
-      
-      // 視覺化連續表現
-      const streakViz = document.getElementById('streakVisualization');
-      streakViz.innerHTML = '';
-      if(data.streak.pattern && data.streak.pattern.length > 0){
-        data.streak.pattern.forEach(pattern => {
-          const div = document.createElement('div');
-          div.className = `streak-day streak-${pattern}`;
-          div.title = pattern === 'up' ? '上漲日' : '下跌日';
-          streakViz.appendChild(div);
-        });
-      }
-
-      // TQQQ 槓桿表現
-      document.getElementById('tqqqPrice').textContent = '+data.tqqq.price;
-      document.getElementById('leverageEfficiency').textContent = data.tqqq.leverageEfficiency==='--'?'--':(data.tqqq.leverageEfficiency+'%');
-      document.getElementById('pathDecay').textContent = 
-        parseFloat(data.tqqq.leverageEfficiency) < 95 ? '有衰減' : '無明顯衰減';
-      document.getElementById('compoundingDrag').textContent = 
-        parseFloat(data.volatility.current) > 30 ? '高' : '低';
-      document.getElementById('tqqqBeta').textContent = data.tqqq.beta;
-
-      // 策略績效
-      if(data.strategy){
-        document.getElementById('strategyReturn').textContent = data.strategy.annualReturn+'%';
-        document.getElementById('strategySharpe').textContent = data.strategy.sharpeRatio;
-        document.getElementById('strategySortino').textContent = data.strategy.sortinoRatio;
-        document.getElementById('maxDrawdown').textContent = data.strategy.maxDrawdown+'%';
-        document.getElementById('strategyAlpha').textContent = data.strategy.alpha+'%';
-        document.getElementById('avgTrades').textContent = data.strategy.avgTrades+' 次';
-      }
-
-      // 市場環境評估
-      document.getElementById('economicCycle').textContent = data.risk.economicCycle;
-      document.getElementById('leverageSuitability').textContent = data.risk.suitability+'/10';
-      document.getElementById('vixLevel').textContent = lastPrice.VIXY ? lastPrice.VIXY.toFixed(1) : '--';
-      document.getElementById('fearGreedIndex').textContent = data.risk.fearGreed;
-
-      // 風險管理指標
-      document.getElementById('leverageTrapRisk').textContent = data.risk.leverageTrapRisk;
-      document.getElementById('leverageTrapRisk').className = 'metric-value ' + 
-        (data.risk.leverageTrapRisk==='高'?'danger':data.risk.leverageTrapRisk==='中'?'warning':'positive');
-      document.getElementById('pathDependencyRisk').textContent = data.risk.pathDependencyRisk;
-      document.getElementById('pathDependencyRisk').className = 'metric-value ' + 
-        (data.risk.pathDependencyRisk==='高'?'danger':data.risk.pathDependencyRisk==='中'?'warning':'positive');
-      document.getElementById('ruinRisk').textContent = data.risk.ruinRisk;
-      document.getElementById('ruinRisk').className = 'metric-value ' + 
-        (data.risk.ruinRisk==='高'?'danger':data.risk.ruinRisk==='中'?'warning':'positive');
-      document.getElementById('maxRecommendedLeverage').textContent = data.risk.maxLeverage+'x';
-      document.getElementById('stopLossLevel').textContent = data.risk.stopLoss;
-
-      // 風險指針
-      const riskNeedle = document.getElementById('riskNeedle');
-      const riskAngle = data.risk.suitability * 18; // 0-180 度
-      riskNeedle.style.transform = `rotate(${riskAngle}deg)`;
-
-      // 交易建議
-      generateTradingRecommendations(data);
-
-      // 顯示界面
-      document.getElementById('loadingIndicator').style.display='none';
-      document.getElementById('errorAlert').style.display='none';
-      document.getElementById('dashboardContent').style.display='grid';
-      document.getElementById('chartSection').style.display='block';
-
-      // 更新圖表
-      updateCharts(data);
-    }
-
-    function generateTradingRecommendations(data){
-      const recommendations = document.getElementById('tradingRecommendations');
-      const isTQQQ = data.signal === 'TQQQ';
-      const vol = parseFloat(data.volatility.current);
-      const distance = parseFloat(data.qqq.distance);
-      
-      let advice = '';
-      
-      if(isTQQQ){
-        advice += '<div style="color:#22c55e;font-weight:600;margin-bottom:10px;">✅ 當前建議：持有 TQQQ</div>';
-        advice += '<div style="margin-bottom:8px;">• QQQ 處於上升趨勢，技術面支持槓桿投資</div>';
-        
-        if(vol < 20){
-          advice += '<div style="margin-bottom:8px;">• 低波動環境，槓桿效率較高</div>';
-        } else if(vol > 30){
-          advice += '<div style="margin-bottom:8px;color:#fbbf24;">⚠️ 波動率偏高，注意槓桿陷阱風險</div>';
-        }
-        
-        if(distance > 5){
-          advice += '<div style="margin-bottom:8px;">• 距離均線較遠，信號強度高</div>';
-        } else {
-          advice += '<div style="margin-bottom:8px;color:#fbbf24;">⚠️ 接近均線，準備止損</div>';
-        }
-      } else {
-        advice += '<div style="color:#ef4444;font-weight:600;margin-bottom:10px;">🛑 當前建議：持有現金</div>';
-        advice += '<div style="margin-bottom:8px;">• QQQ 處於下降趨勢，避免槓桿投資</div>';
-        advice += '<div style="margin-bottom:8px;">• 等待突破 200日均線再進場</div>';
-        
-        if(Math.abs(distance) < 2){
-          advice += '<div style="margin-bottom:8px;color:#60a5fa;">💡 接近均線，關注突破信號</div>';
-        }
-      }
-      
-      advice += '<hr style="margin:15px 0;border:none;border-top:1px solid rgba(255,255,255,.1);">';
-      advice += '<div style="font-size:.9rem;color:#a1a1aa;">';
-      advice += '<div>• 建議倉位：' + (isTQQQ ? '滿倉 TQQQ' : '100% 現金') + '</div>';
-      advice += '<div>• 風險等級：' + data.risk.leverageTrapRisk + '</div>';
-      advice += '<div>• 預期持有：' + (Math.abs(distance) > 3 ? '中長期' : '短期') + '</div>';
-      advice += '</div>';
-      
-      recommendations.innerHTML = advice;
-    }
-
-    // ====== 圖表更新 ======
-    let priceChart = null;
-    let volatilityChart = null;
-    let performanceChart = null;
-
-    function updateCharts(data){
-      updatePriceChart(data);
-      updateVolatilityChart(data);
-      updatePerformanceChart(data);
-    }
-
-    function updatePriceChart(data){
-      const ctx = document.getElementById('priceChart').getContext('2d');
-      const chartData = data.historicalData;
-      
-      if(priceChart) priceChart.destroy();
-      
-      priceChart = new Chart(ctx, {
-        type: 'line',
-        data: {
-          labels: chartData.map(d => d.date),
-          datasets: [
-            {
-              label: 'QQQ Price',
-              data: chartData.map(d => d.price),
-              borderColor: '#60a5fa',
-              backgroundColor: 'rgba(96, 165, 250, 0.1)',
-              borderWidth: 2,
-              fill: false,
-              tension: 0.1
-            },
-            {
-              label: '200-day SMA',
-              data: chartData.map(d => d.sma200),
-              borderColor: '#fbbf24',
-              borderWidth: 2,
-              borderDash: [5, 5],
-              fill: false,
-              tension: 0.1
-            }
-          ]
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          plugins: {
-            legend: {
-              labels: { color: '#e4e4e7' }
-            }
-          },
-          scales: {
-            x: { 
-              ticks: { color: '#a1a1aa' },
-              grid: { color: 'rgba(255,255,255,0.1)' }
-            },
-            y: { 
-              ticks: { color: '#a1a1aa' },
-              grid: { color: 'rgba(255,255,255,0.1)' }
-            }
-          }
-        }
-      });
-    }
-
-    function updateVolatilityChart(data){
-      const ctx = document.getElementById('volatilityChart').getContext('2d');
-      
-      if(volatilityChart) volatilityChart.destroy();
-      
-      // 模擬波動率數據
-      const volData = [];
-      const perfData = [];
-      for(let vol = 5; vol <= 60; vol += 5){
-        volData.push(vol);
-        // 根據論文，低波動率時槓桿表現更好
-        const performance = vol < 20 ? 300 - vol : vol < 40 ? 280 - vol*2 : 200 - vol*3;
-        perfData.push(Math.max(50, performance));
-      }
-      
-      volatilityChart = new Chart(ctx, {
-        type: 'line',
-        data: {
-          labels: volData.map(v => v + '%'),
-          datasets: [
-            {
-              label: '3x 槓桿相對表現',
-              data: perfData,
-              borderColor: '#22c55e',
-              backgroundColor: 'rgba(34, 197, 94, 0.1)',
-              borderWidth: 3,
-              fill: true,
-              tension: 0.3
-            }
-          ]
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          plugins: {
-            legend: {
-              labels: { color: '#e4e4e7' }
-            }
-          },
-          scales: {
-            x: { 
-              title: { display: true, text: '年化波動率', color: '#e4e4e7' },
-              ticks: { color: '#a1a1aa' },
-              grid: { color: 'rgba(255,255,255,0.1)' }
-            },
-            y: { 
-              title: { display: true, text: '相對表現 (%)', color: '#e4e4e7' },
-              ticks: { color: '#a1a1aa' },
-              grid: { color: 'rgba(255,255,255,0.1)' }
-            }
-          }
-        }
-      });
-    }
-
-    function updatePerformanceChart(data){
-      const ctx = document.getElementById('performanceChart').getContext('2d');
-      
-      if(performanceChart) performanceChart.destroy();
-      
-      // 模擬累積報酬數據
-      const dates = [];
-      const lrsReturns = [];
-      const buyHoldReturns = [];
-      
-      let lrsValue = 1000;
-      let buyHoldValue = 1000;
-      
-      const startDate = new Date();
-      startDate.setFullYear(startDate.getFullYear() - 2);
-      
-      for(let i = 0; i < 500; i++){
-        const date = new Date(startDate);
-        date.setDate(date.getDate() + i);
-        dates.push(date.toISOString().slice(0, 10));
-        
-        // 模擬市場波動
-        const marketReturn = (Math.random() - 0.45) * 0.02; // 略微正偏差
-        const volatility = 0.01 + Math.random() * 0.02;
-        
-        // 買入持有
-        buyHoldValue *= (1 + marketReturn);
-        
-        // LRS 策略（簡化模擬）
-        const isLowVol = volatility < 0.015;
-        if(isLowVol && marketReturn > 0){
-          lrsValue *= (1 + marketReturn * 2.8); // 槓桿效果
-        } else if(isLowVol){
-          lrsValue *= (1 + marketReturn * 2.8);
-        } else {
-          lrsValue *= (1 + 0.0001); // 現金回報
-        }
-        
-        lrsReturns.push(lrsValue);
-        buyHoldReturns.push(buyHoldValue);
-      }
-      
-      performanceChart = new Chart(ctx, {
-        type: 'line',
-        data: {
-          labels: dates,
-          datasets: [
-            {
-              label: 'LRS 策略',
-              data: lrsReturns,
-              borderColor: '#22c55e',
-              backgroundColor: 'rgba(34, 197, 94, 0.1)',
-              borderWidth: 3,
-              fill: false,
-              tension: 0.1
-            },
-            {
-              label: '買入持有',
-              data: buyHoldReturns,
-              borderColor: '#60a5fa',
-              backgroundColor: 'rgba(96, 165, 250, 0.1)',
-              borderWidth: 2,
-              fill: false,
-              tension: 0.1
-            }
-          ]
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          plugins: {
-            legend: {
-              labels: { color: '#e4e4e7' }
-            }
-          },
-          scales: {
-            x: { 
-              ticks: { color: '#a1a1aa' },
-              grid: { color: 'rgba(255,255,255,0.1)' }
-            },
-            y: { 
-              title: { display: true, text: '累積價值 ($)', color: '#e4e4e7' },
-              ticks: { color: '#a1a1aa' },
-              grid: { color: 'rgba(255,255,255,0.1)' }
-            }
-          }
-        }
-      });
-    }
-
-    // ====== 主流程和事件處理 ======
-    async function initAll(){
-      try{
-        const data = await fetchMarketData();
-        updateDashboard(data);
-
-        // 啟動 WebSocket
-        openWS();
-        
-        // 後備輪詢機制
-        setTimeout(()=>{ 
-          if(!wsHealthy) startPollFallback(); 
-        }, 10000);
-        
-        setInterval(()=>{ 
-          if(wsHealthy) stopPollFallback(); 
-          else startPollFallback(); 
-        }, 15000);
-        
-      }catch(err){
-        console.error('初始化錯誤:', err);
-        document.getElementById('loadingIndicator').style.display='none';
-        document.getElementById('errorAlert').style.display='block';
-        document.getElementById('errorAlert').innerHTML = 
-          '⚠️ 初始化失敗：' + (err.message || '未知錯誤') + '<br>請檢查網路連線或API配額';
-      }
-    }
-
-    async function refreshData(){
-      document.getElementById('loadingIndicator').style.display='block';
-      document.getElementById('dashboardContent').style.display='none';
-      document.getElementById('chartSection').style.display='none';
-      document.getElementById('errorAlert').style.display='none';
-      
-      try{
-        // 清除部分快取以獲取最新數據
-        ['quote_QQQ', 'quote_TQQQ', 'quote_VIXY'].forEach(key => {
-          localStorage.removeItem(LS_PREFIX + key);
-        });
-        
-        const data = await fetchMarketData();
-        updateDashboard(data);
-      }catch(err){
-        console.error('更新數據錯誤:', err);
-        document.getElementById('loadingIndicator').style.display='none';
-        document.getElementById('errorAlert').style.display='block';
-        document.getElementById('errorAlert').innerHTML = 
-          '⚠️ 更新失敗：' + (err.message || '未知錯誤');
-      }
-    }
-
-    // ====== REST 後備輪詢 ======
-    let pollTimer=null;
-    function startPollFallback(){
-      if(pollTimer) return;
-      pollTimer = setInterval(async ()=>{
-        try{
-          const [q1, q2, q3] = await Promise.all([
-            getQuote('QQQ'), 
-            getQuote('TQQQ'), 
-            getQuote('VIXY')
-          ]);
-          lastPrice.QQQ = q1.price; 
-          lastPrice.TQQQ = q2.price; 
-          lastPrice.VIXY = q3.price;
-          
-          updateLiveQuoteUI('QQQ', q1.price, q1.prevClose);
-          updateLiveQuoteUI('TQQQ', q2.price, q2.prevClose);
-          
-          document.getElementById('lastUpdate').textContent = 
-            new Date().toLocaleString('zh-TW');
-        }catch(e){ 
-          console.log('輪詢更新失敗:', e.message); 
-        }
-      }, 30*1000); // 30秒輪詢
-    }
-
-    function stopPollFallback(){
-      if(pollTimer){ 
-        clearInterval(pollTimer); 
-        pollTimer=null; 
-      }
-    }
-
-    // ====== 頁面生命週期 ======
-    document.addEventListener('DOMContentLoaded', initAll);
-    document.addEventListener('visibilitychange', ()=>{ 
-      if(!document.hidden) {
-        // 頁面重新激活時刷新數據
-        setTimeout(refreshData, 1000);
-      }
-    });
-
-    // ====== 鍵盤快捷鍵 ======
-    document.addEventListener('keydown', (e) => {
-      if(e.key === 'F5' || (e.ctrlKey && e.key === 'r')){
-        e.preventDefault();
-        refreshData();
-      }
-    });
-
-    // ====== 錯誤處理和日誌 ======
-    window.addEventListener('error', (e) => {
-      console.error('全局錯誤:', e.error);
-    });
-
-    window.addEventListener('unhandledrejection', (e) => {
-      console.error('未處理的 Promise 拒絕:', e.reason);
-    });
-
-    // ====== 性能監控 ======
-    const performanceMetrics = {
-      apiCalls: 0,
-      cacheHits: 0,
-      errors: 0,
-      startTime: Date.now()
-    };
-
-    // 原有的 fetchJSON 函數增強
-    const originalFetchJSON = fetchJSON;
-    fetchJSON = async function(url, cacheKey, ttlMs){
-      performanceMetrics.apiCalls++;
-      
-      if(cacheKey && cacheGet(cacheKey)){
-        performanceMetrics.cacheHits++;
-      }
-      
-      try{
-        return await originalFetchJSON(url, cacheKey, ttlMs);
-      }catch(e){
-        performanceMetrics.errors++;
-        throw e;
-      }
-    };
-
-    // 每 5 分鐘輸出性能統計（僅在開發模式）
-    if(window.location.hostname === 'localhost'){
-      setInterval(() => {
-        console.log('性能統計:', {
-          ...performanceMetrics,
-          uptime: Math.round((Date.now() - performanceMetrics.startTime) / 1000) + '秒',
-          cacheHitRate: performanceMetrics.apiCalls > 0 ? 
-            (performanceMetrics.cacheHits / performanceMetrics.apiCalls * 100).toFixed(1) + '%' : '0%'
-        });
-      }, 5 * 60 * 1000);
-    }
-
-    // ====== 公開 API 供調試使用 ======
-    if(window.location.hostname === 'localhost'){
-      window.TQQQDashboard = {
-        refreshData,
-        getPerformanceMetrics: () => performanceMetrics,
-        clearCache: () => {
-          Object.keys(localStorage).forEach(key => {
-            if(key.startsWith(LS_PREFIX)){
-              localStorage.removeItem(key);
-            }
-          });
-        },
-        testWebSocket: () => {
-          if(ws && ws.readyState === WebSocket.OPEN){
-            ws.send(JSON.stringify({type: 'ping'}));
-          }
-        }
-      };
-    }
-
-  </script>
-</body>
-</html>
