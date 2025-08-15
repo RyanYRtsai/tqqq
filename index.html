@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>TQQQ LRS 策略儀表板（Finnhub）</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;color:#333}
+    .container{max-width:1400px;margin:0 auto;padding:20px;position:relative}
+    .header{text-align:center;margin-bottom:30px;color:white;position:relative}
+    .header h1{font-size:2.2rem;margin-bottom:10px;text-shadow:2px 2px 4px rgba(0,0,0,.3)}
+    .last-updated{background:rgba(255,255,255,.2);padding:8px 16px;border-radius:20px;display:inline-block;backdrop-filter:blur(10px)}
+    .header-right{position:absolute;top:0;right:0;display:flex;gap:8px;align-items:center}
+    .dashboard{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px;margin-bottom:30px}
+    .card{background:rgba(255,255,255,.95);border-radius:16px;padding:24px;box-shadow:0 8px 32px rgba(0,0,0,.1);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,.2);transition:transform .3s ease,box-shadow .3s ease}
+    .card:hover{transform:translateY(-4px);box-shadow:0 12px 40px rgba(0,0,0,.15)}
+    .card-title{font-size:1.15rem;font-weight:600;margin-bottom:16px;color:#2d3748;display:flex;align-items:center;gap:8px}
+    .signal-card{text-align:center;position:relative;overflow:hidden}
+    .signal-status{font-size:2.6rem;font-weight:bold;margin:20px 0;text-shadow:2px 2px 4px rgba(0,0,0,.1)}
+    .signal-tqqq{color:#22c55e;animation:pulse 2s ease-in-out infinite}
+    .signal-cash{color:#ef4444}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.7}}
+    .signal-description{font-size:1.05rem;color:#64748b;margin-bottom:16px}
+    .action-required{background:linear-gradient(135deg,#fbbf24,#f59e0b);color:#fff;padding:12px 24px;border-radius:8px;font-weight:600;font-size:1.05rem;animation:glow 2s ease-in-out infinite alternate}
+    @keyframes glow{from{box-shadow:0 0 20px rgba(251,191,36,.4)}to{box-shadow:0 0 30px rgba(251,191,36,.8)}}
+    .metric{display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid #e2e8f0}
+    .metric:last-child{border-bottom:none}
+    .metric-label{color:#64748b;font-size:.9rem}
+    .metric-value{font-weight:600;font-size:1.05rem}
+    .positive{color:#22c55e}
+    .negative{color:#ef4444}
+    .chart-container{grid-column:1 / -1;height:400px}
+    .loading{text-align:center;color:white;font-size:1.1rem;margin:40px 0}
+    .loading::after{content:'...';animation:dots 1.5s steps(4,end) infinite}
+    @keyframes dots{0%,20%{content:''}40%{content:'.'}60%{content:'..'}80%,100%{content:'...'}}
+    .refresh-btn{background:rgba(255,255,255,.2);border:1px solid rgba(255,255,255,.3);color:white;padding:8px 12px;border-radius:8px;cursor:pointer;transition:all .3s ease;backdrop-filter:blur(10px)}
+    .refresh-btn:hover{background:rgba(255,255,255,.3);transform:scale(1.05)}
+    .alert{background:linear-gradient(135deg,#dc2626,#991b1b);color:#fff;padding:16px;border-radius:8px;margin-bottom:20px;text-align:center;font-weight:600}
+    .badge{display:inline-block;padding:4px 8px;border-radius:999px;font-size:.78rem}
+    .badge-ok{background:#16a34a;color:white}
+    .badge-fail{background:#dc2626;color:white}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>📊 TQQQ LRS 策略儀表板（Finnhub）</h1>
+      <div class="last-updated">
+        <span id="lastUpdate">載入中...</span>
+        <button class="refresh-btn" onclick="refreshData()">🔄 更新（日線）</button>
+      </div>
+      <div class="header-right">
+        <button class="refresh-btn" onclick="runHealthCheck()">🩺 健康檢查</button>
+        <span id="apiHealth" class="badge">API 檢測中</span>
+        <span id="wsHealth" class="badge">WS 檢測中</span>
+      </div>
+    </div>
+
+    <div id="loadingIndicator" class="loading"> 正在載入市場數據 </div>
+    <div id="errorAlert" class="alert" style="display:none;">⚠️ 無法載入數據，請檢查金鑰或稍後重試</div>
+
+    <div id="dashboardContent" class="dashboard" style="display:none;">
+      <div class="card signal-card">
+        <h2 class="card-title">🎯 當前策略信號</h2>
+        <div id="signalStatus" class="signal-status">載入中...</div>
+        <div id="signalDescription" class="signal-description">分析中...</div>
+        <div id="actionRequired" class="action-required" style="display:none;">需要調整倉位！</div>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title">📈 QQQ 價格資訊</h2>
+        <div class="metric"><span class="metric-label">當前價格</span><span id="qqqPrice" class="metric-value">$--</span></div>
+        <div class="metric"><span class="metric-label">200日均線</span><span id="qqqSma200" class="metric-value">$--</span></div>
+        <div class="metric"><span class="metric-label">距離均線</span><span id="qqqDistance" class="metric-value">--%</span></div>
+        <div class="metric"><span class="metric-label">日變化</span><span id="qqqChange" class="metric-value">--%</span></div>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title">🚀 TQQQ 價格資訊</h2>
+        <div class="metric"><span class="metric-label">當前價格</span><span id="tqqqPrice" class="metric-value">$--</span></div>
+        <div class="metric"><span class="metric-label">日變化</span><span id="tqqqChange" class="metric-value">--%</span></div>
+        <div class="metric"><span class="metric-label">波動率 (20日)</span><span id="tqqqVolatility" class="metric-value">--%</span></div>
+        <div class="metric"><span class="metric-label">RSI (14日)</span><span id="tqqqRsi" class="metric-value">--</span></div>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title">📊 策略統計</h2>
+        <div class="metric"><span class="metric-label">本月信號變化</span><span id="monthlySignals" class="metric-value">-- 次</span></div>
+        <div class="metric"><span class="metric-label">目前週期天數</span><span id="currentCycleDays" class="metric-value">-- 天</span></div>
+        <div class="metric"><span class="metric-label">TQQQ 持有比例 (YTD)</span><span id="tqqqHoldingRatio" class="metric-value">--%</span></div>
+        <div class="metric"><span class="metric-label">策略勝率 (近30天)</span><span id="winRate" class="metric-value">--%</span></div>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title">⚠️ 風險指標</h2>
+        <div class="metric"><span class="metric-label">VIX 指數</span><span id="vixLevel" class="metric-value">--</span></div>
+        <div class="metric"><span class="metric-label">市場趨勢強度</span><span id="trendStrength" class="metric-value">--</span></div>
+        <div class="metric"><span class="metric-label">回撤風險</span><span id="drawdownRisk" class="metric-value">--</span></div>
+        <div class="metric"><span class="metric-label">信號穩定性</span><span id="signalStability" class="metric-value">--</span></div>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title">💡 建議行動</h2>
+        <div id="recommendations" style="line-height:1.6;">
+          <div class="loading">分析中...</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="chartSection" style="display:none;">
+      <div class="card chart-container">
+        <h2 class="card-title">📈 QQQ 價格 vs 200日均線 (近90天)</h2>
+        <canvas id="priceChart"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ====== Finnhub 設定 ======
+    const FINNHUB_KEY = 'd2ev6o9r01qmrq4p164gd2ev6o9r01qmrq4p1650';
+    const FH_BASE = 'https://finnhub.io/api/v1';
+    const WS_URL = `wss://ws.finnhub.io?token=${encodeURIComponent(FINNHUB_KEY)}`;
+
+    // ====== 額度友善策略（可調） ======
+    const QUOTE_CACHE_MS = 10 * 60 * 1000;      // /quote 快取 10 分鐘
+    const CANDLE_CACHE_MS = 24 * 60 * 60 * 1000; // 日線快取 1 天
+    const WS_POLL_FALLBACK_MS = 2 * 60 * 1000;   // WS 失敗→每 2 分鐘輪詢 QQQ/TQQQ
+    const VIX_REST_FALLBACK_MS = 10 * 60 * 1000; // VIX 串流失敗→每 10 分鐘抓一次
+    const VIX_WS_WAIT_MS = 20 * 1000;            // 嘗試 VIX 串流等待 20 秒
+
+    // ====== localStorage 快取 ======
+    const LS_PREFIX = 'tqqq_fh_';
+    function cacheGet(k){try{const r=localStorage.getItem(LS_PREFIX+k);if(!r)return null;const o=JSON.parse(r);if(o.exp && Date.now()>o.exp){localStorage.removeItem(LS_PREFIX+k);return null}return o.val}catch{return null}}
+    function cacheSet(k,v,ttl){localStorage.setItem(LS_PREFIX+k,JSON.stringify({val:v,exp:ttl?Date.now()+ttl:0}))}
+    async function fetchJSON(url, cacheKey=null, ttlMs=0){
+      if(cacheKey){const c=cacheGet(cacheKey); if(c) return c;}
+      const res = await fetch(url);
+      if(!res.ok) throw new Error('HTTP '+res.status);
+      const j = await res.json();
+      if(cacheKey && ttlMs) cacheSet(cacheKey,j,ttlMs);
+      return j;
+    }
+
+    // ====== 指標 ======
+    function computeSMA(arr, win){ if(arr.length<win) return null; const s=arr.slice(-win).reduce((a,b)=>a+b,0); return s/win }
+    function computeRSI(arr, p=14){
+      if(arr.length<=p) return null;
+      let g=0,l=0;
+      for(let i=arr.length-p;i<arr.length;i++){
+        const d = arr[i]-arr[i-1];
+        if(d>=0) g+=d; else l-=d;
+      }
+      const rs = l===0 ? 100 : g/l;
+      return 100 - (100/(1+rs));
+    }
+    function computeVol(arr, look=20){
+      if(arr.length<look+1) return null;
+      const seg = arr.slice(-look-1);
+      const rets = [];
+      for(let i=1;i<seg.length;i++) rets.push((seg[i]-seg[i-1])/seg[i-1]);
+      const m = rets.reduce((a,b)=>a+b,0)/rets.length;
+      const v = rets.reduce((a,b)=>a+Math.pow(b-m,2),0)/(rets.length-1);
+      return Math.sqrt(v)*Math.sqrt(252)*100;
+    }
+
+    // ====== REST 端點 ======
+    async function getDailyCandles(symbol, days=500){
+      const to = Math.floor(Date.now()/1000);
+      const from = to - Math.floor(days*24*60*60*1.2);
+      const url = `${FH_BASE}/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=D&from=${from}&to=${to}&token=${encodeURIComponent(FINNHUB_KEY)}`;
+      const j = await fetchJSON(url, `candle_${symbol}`, CANDLE_CACHE_MS);
+      if(j.s!=='ok') throw new Error('No candle data: '+symbol);
+      const dates = j.t.map(ts => new Date(ts*1000).toISOString().slice(0,10));
+      const closes = j.c;
+      return {dates, closes};
+    }
+    async function getQuote(symbol){
+      const url = `${FH_BASE}/quote?symbol=${encodeURIComponent(symbol)}&token=${encodeURIComponent(FINNHUB_KEY)}`;
+      const j = await fetchJSON(url, `quote_${symbol}`, QUOTE_CACHE_MS);
+      return { price:j.c||0, changePct:j.dp||0, prevClose:j.pc||0, ts:j.t? new Date(j.t*1000): new Date() };
+    }
+
+    // ====== WebSocket（即時） ======
+    let ws=null, wsTimer=null, wsBackoff=2000, wsHealthy=false;
+    const subs = new Set(['QQQ','TQQQ']); // 先訂股票
+    const lastPrice = { QQQ: null, TQQQ: null, VIX: null };
+    const prevClose = { QQQ: null, TQQQ: null, VIX: null };
+
+    const VIX_SYMBOL_CANDIDATES = ['^VIX','VIX','CBOE:VIX','INDEX:VIX','TVC:VIX'];
+    let vixStreamingOK = false;
+    let vixRestTimer = null;
+
+    function setWSBadge(ok){
+      wsHealthy = ok;
+      const el = document.getElementById('wsHealth');
+      el.textContent = ok ? 'WS 連線正常' : 'WS 未連線';
+      el.className = 'badge ' + (ok ? 'badge-ok' : 'badge-fail');
+    }
+    function setAPIBadge(ok, msg=''){
+      const el = document.getElementById('apiHealth');
+      el.textContent = ok ? 'API 正常' : 'API 異常';
+      el.className = 'badge ' + (ok ? 'badge-ok' : 'badge-fail');
+      if(msg) el.title = msg;
+    }
+
+    function openWS(){
+      try{ ws = new WebSocket(WS_URL); }catch(e){ setWSBadge(false); scheduleReconnect(); return; }
+      ws.onopen = ()=>{
+        setWSBadge(true);
+        wsBackoff = 2000;
+        subs.forEach(s => ws.send(JSON.stringify({type:'subscribe', symbol:s})));
+        // 嘗試訂閱 VIX 指數（多種候選符號）
+        VIX_SYMBOL_CANDIDATES.forEach(sym => ws.send(JSON.stringify({type:'subscribe', symbol:sym})));
+        // 若 20 秒沒收到 VIX 任何訊息，啟用 REST 後備
+        setTimeout(()=>{ if(!vixStreamingOK) startVixRestFallback(); }, VIX_WS_WAIT_MS);
+      };
+      ws.onmessage = (ev)=>{
+        const msg = JSON.parse(ev.data);
+        if(msg.type==='trade' && Array.isArray(msg.data)){
+          let gotVix = false;
+          msg.data.forEach(t=>{
+            const s = t.s, p = t.p;
+            if(s==='QQQ'){ lastPrice.QQQ=p; updateLiveQuoteUI('QQQ', p); }
+            else if(s==='TQQQ'){ lastPrice.TQQQ=p; updateLiveQuoteUI('TQQQ', p); }
+            else if(s && /VIX/i.test(s)){ // 任一含 VIX 的符號
+              gotVix = true;
+              lastPrice.VIX = p;
+              updateVixUI(p);
+            }
+          });
+          if(gotVix){ vixStreamingOK = true; stopVixRestFallback(); }
+          document.getElementById('lastUpdate').textContent = new Date().toLocaleString('zh-TW');
+        }
+      };
+      ws.onerror = ()=>{ setWSBadge(false); };
+      ws.onclose = ()=>{ setWSBadge(false); scheduleReconnect(); };
+    }
+    function scheduleReconnect(){
+      if(wsTimer) clearTimeout(wsTimer);
+      wsTimer = setTimeout(()=>openWS(), wsBackoff);
+      wsBackoff = Math.min(wsBackoff*1.8, 60000);
+    }
+
+    // ====== WS 掛掉→REST 輪詢後備（低頻） ======
+    let pollTimer=null;
+    function startPollFallback(){
+      if(pollTimer) return;
+      pollTimer = setInterval(async ()=>{
+        try{
+          const [q1, q2] = await Promise.all([getQuote('QQQ'), getQuote('TQQQ')]);
+          lastPrice.QQQ = q1.price; lastPrice.TQQQ = q2.price;
+          updateLiveQuoteUI('QQQ', q1.price, q1.prevClose);
+          updateLiveQuoteUI('TQQQ', q2.price, q2.prevClose);
+          document.getElementById('lastUpdate').textContent = new Date().toLocaleString('zh-TW');
+        }catch(e){ /* 靜默失敗 */ }
+      }, WS_POLL_FALLBACK_MS);
+    }
+    function stopPollFallback(){ if(pollTimer){ clearInterval(pollTimer); pollTimer=null; } }
+
+    // ====== VIX REST 後備（10 分鐘一次） ======
+    async function vixRestOnce(){
+      try{
+        // 先試 VIX 指數；若不支援，再試 VIXY
+        let q = await getQuote('^VIX').catch(()=>getQuote('VIX'));
+        if(!q || !q.price){ q = await getQuote('VIXY'); }
+        if(q && q.price){ lastPrice.VIX = q.price; updateVixUI(q.price); }
+      }catch(e){ /* 靜默 */ }
+    }
+    function startVixRestFallback(){
+      if(vixRestTimer) return;
+      vixRestOnce();
+      vixRestTimer = setInterval(vixRestOnce, VIX_REST_FALLBACK_MS);
+    }
+    function stopVixRestFallback(){ if(vixRestTimer){ clearInterval(vixRestTimer); vixRestTimer=null; } }
+
+    // ====== UI 更新（即時數字） ======
+    function updateLiveQuoteUI(symbol, price, givenPrevClose){
+      const pc = givenPrevClose ?? prevClose[symbol] ?? null;
+      if(symbol==='QQQ'){
+        document.getElementById('qqqPrice').textContent = '$' + (price?.toFixed(2) ?? '--');
+        if(pc){
+          const chg = ((price-pc)/pc*100);
+          document.getElementById('qqqChange').textContent = (isFinite(chg)? chg.toFixed(2): '--') + '%';
+          document.getElementById('qqqChange').className = 'metric-value ' + (chg>=0?'positive':'negative');
+        }
+      }else if(symbol==='TQQQ'){
+        document.getElementById('tqqqPrice').textContent = '$' + (price?.toFixed(2) ?? '--');
+        const pc2 = prevClose.TQQQ;
+        if(pc2){
+          const chg2 = ((price-pc2)/pc2*100);
+          document.getElementById('tqqqChange').textContent = (isFinite(chg2)? chg2.toFixed(2): '--') + '%';
+          document.getElementById('tqqqChange').className = 'metric-value ' + (chg2>=0?'positive':'negative');
+        }
+      }
+    }
+    function updateVixUI(vixPrice){
+      if(!vixPrice) return;
+      document.getElementById('vixLevel').textContent = vixPrice.toFixed(2);
+      const risk = vixPrice>30? '高' : vixPrice>20? '中' : '低';
+      document.getElementById('drawdownRisk').textContent = risk;
+    }
+
+    // ====== 主流程：抓日線、算指標、畫圖 ======
+    let chartInstance=null;
+    async function fetchMarketData(){
+      // 先抓 quote 拿前收，便於計算變化 %
+      const [qQQQ, qTQQQ] = await Promise.all([ getQuote('QQQ'), getQuote('TQQQ') ]);
+      prevClose.QQQ = qQQQ.prevClose; prevClose.TQQQ = qTQQQ.prevClose;
+
+      // 日線（快取 1 天）
+      const [dQQQ, dTQQQ] = await Promise.all([ getDailyCandles('QQQ', 500), getDailyCandles('TQQQ', 500) ]);
+
+      const qqqSMA200 = computeSMA(dQQQ.closes, 200);
+      const tVol = computeVol(dTQQQ.closes, 20);
+      const tRSI = computeRSI(dTQQQ.closes, 14);
+
+      // 近 90 天圖
+      const hist = [];
+      const n = Math.min(90, dQQQ.dates.length);
+      for(let i=dQQQ.dates.length - n; i<dQQQ.dates.length; i++){
+        const slice = dQQQ.closes.slice(0, i+1);
+        const sma = computeSMA(slice, 200);
+        hist.push({ date: dQQQ.dates[i], price: dQQQ.closes[i], sma200: sma });
+      }
+
+      // 以 quote 為初始現價，之後由 WS 覆蓋
+      lastPrice.QQQ = qQQQ.price || dQQQ.closes.at(-1);
+      lastPrice.TQQQ = qTQQQ.price || dTQQQ.closes.at(-1);
+
+      // LRS 訊號
+      const isAbove = qqqSMA200 ? lastPrice.QQQ > qqqSMA200 : null;
+      const distance = qqqSMA200 ? ((lastPrice.QQQ - qqqSMA200)/qqqSMA200*100) : null;
+
+      // 策略統計
+      let monthlySignals = 0, holdingCount = 0;
+      for(let i=1;i<hist.length;i++){
+        const a=hist[i-1], b=hist[i];
+        if(a.sma200 && b.sma200){
+          const pa = a.price>a.sma200, pb = b.price>b.sma200;
+          if(pa!==pb) monthlySignals++;
+          if(pb) holdingCount++;
+        }
+      }
+      let streak=1;
+      for(let i=hist.length-2;i>=0;i--){
+        const a=hist[i], b=hist[i+1];
+        if(a.sma200 && b.sma200 && (a.price>a.sma200)===(b.price>b.sma200)) streak++;
+        else break;
+      }
+
+      return {
+        lastUpdate: new Date().toLocaleString('zh-TW'),
+        qqq:{
+          price: (lastPrice.QQQ||0).toFixed(2),
+          change: (qQQQ.changePct??0).toFixed(2),
+          sma200: qqqSMA200? qqqSMA200.toFixed(2): '--',
+          distance: qqqSMA200? distance.toFixed(2): '--',
+          isAboveSma: !!isAbove
+        },
+        tqqq:{
+          price: (lastPrice.TQQQ||0).toFixed(2),
+          change: (qTQQQ.changePct??0).toFixed(2),
+          volatility: tVol? tVol.toFixed(1): '--',
+          rsi: tRSI? tRSI.toFixed(0): '--'
+        },
+        risk:{
+          vix: lastPrice.VIX? lastPrice.VIX.toFixed(2): '--',
+          trendStrength: (qqqSMA200 && Math.abs(distance)>5)? '強':'弱',
+          drawdownRisk: '--', // 由 updateVixUI 動態填
+          signalStability: monthlySignals<2? '穩定':'不穩定'
+        },
+        historicalData: hist
+      };
+    }
+
+    function updateDashboard(data){
+      document.getElementById('lastUpdate').textContent = data.lastUpdate;
+
+      const isTQQQ = data.qqq.isAboveSma;
+      const signalEl = document.getElementById('signalStatus');
+      signalEl.className='signal-status ' + (isTQQQ? 'signal-tqqq':'signal-cash');
+      signalEl.textContent = isTQQQ? '持有 TQQQ':'持有 現金腿';
+      document.getElementById('signalDescription').textContent = isTQQQ? 'QQQ 收盤 > SMA200，啟用槓桿腿':'QQQ 收盤 ≤ SMA200，轉入現金腿';
+      document.getElementById('actionRequired').style.display='none';
+
+      document.getElementById('qqqPrice').textContent = '$'+data.qqq.price;
+      document.getElementById('qqqSma200').textContent = data.qqq.sma200==='--'?'--':('$'+data.qqq.sma200);
+      document.getElementById('qqqDistance').textContent = data.qqq.distance==='--'?'--':(data.qqq.distance+'%');
+      document.getElementById('qqqChange').textContent = (data.qqq.change||'0')+'%';
+      document.getElementById('qqqChange').className = 'metric-value ' + ((parseFloat(data.qqq.change)||0)>=0?'positive':'negative');
+
+      document.getElementById('tqqqPrice').textContent = '$'+data.tqqq.price;
+      document.getElementById('tqqqChange').textContent = (data.tqqq.change||'0')+'%';
+      document.getElementById('tqqqChange').className = 'metric-value ' + ((parseFloat(data.tqqq.change)||0)>=0?'positive':'negative');
+      document.getElementById('tqqqVolatility').textContent = data.tqqq.volatility==='--'?'--':(data.tqqq.volatility+'%');
+      document.getElementById('tqqqRsi').textContent = data.tqqq.rsi;
+
+      document.getElementById('vixLevel').textContent = data.risk.vix || '--';
+      document.getElementById('trendStrength').textContent = data.risk.trendStrength;
+      document.getElementById('drawdownRisk').textContent = data.risk.drawdownRisk;
+      document.getElementById('signalStability').textContent = data.risk.signalStability;
+
+      const ctx = document.getElementById('priceChart').getContext('2d');
+      const labels = data.historicalData.map(d=>d.date);
+      const priceSeries = data.historicalData.map(d=>d.price);
+      const smaSeries = data.historicalData.map(d=>d.sma200);
+      if(chartInstance) chartInstance.destroy();
+      chartInstance = new Chart(ctx,{
+        type:'line',
+        data:{labels,datasets:[
+          {label:'QQQ',data:priceSeries,borderWidth:2,fill:false,tension:.2},
+          {label:'SMA200',data:smaSeries,borderWidth:2,borderDash:[6,4],fill:false,tension:.2}
+        ]},
+        options:{responsive:true,plugins:{legend:{display:true}}}
+      });
+
+      document.getElementById('loadingIndicator').style.display='none';
+      document.getElementById('errorAlert').style.display='none';
+      document.getElementById('dashboardContent').style.display='grid';
+      document.getElementById('chartSection').style.display='block';
+    }
+
+    // ====== 健康檢查（一次性 /quote：QQQ、TQQQ、VIX） ======
+    async function runHealthCheck(){
+      try{
+        const [q1,q2,q3] = await Promise.allSettled([
+          getQuote('QQQ'), getQuote('TQQQ'),
+          // VIX 指數（若不通再試 VIXY）
+          (async()=>{ try{ return await getQuote('^VIX'); }catch{ try{ return await getQuote('VIX'); }catch{ return await getQuote('VIXY'); } } })()
+        ]);
+        const ok = [q1,q2,q3].every(x => x.status==='fulfilled' && x.value && x.value.price);
+        setAPIBadge(ok, ok?'OK':'有端點失敗（點我看 Console）');
+        console.log('[HealthCheck] results:', q1,q2,q3);
+      }catch(e){
+        setAPIBadge(false, String(e));
+        console.error('[HealthCheck] error:', e);
+      }
+      // WS 狀態同步顯示
+      setWSBadge(wsHealthy);
+    }
+
+    async function initAll(){
+      try{
+        const data = await fetchMarketData();
+        updateDashboard(data);
+
+        openWS();
+        // 10 秒後若 WS 仍不健康→啟動後備輪詢；健康則停止
+        setTimeout(()=>{ if(!wsHealthy) startPollFallback(); }, 10000);
+        setInterval(()=>{ if(wsHealthy) stopPollFallback(); else startPollFallback(); }, 15000);
+
+        // 初始 API/WS badge
+        setAPIBadge(true,'');
+        setWSBadge(wsHealthy);
+      }catch(err){
+        console.error(err);
+        document.getElementById('loadingIndicator').style.display='none';
+        document.getElementById('errorAlert').style.display='block';
+        setAPIBadge(false, '初始化失敗');
+      }
+    }
+
+    async function refreshData(){
+      document.getElementById('loadingIndicator').style.display='block';
+      document.getElementById('dashboardContent').style.display='none';
+      document.getElementById('chartSection').style.display='none';
+      try{
+        const data = await fetchMarketData();
+        updateDashboard(data);
+      }catch(err){
+        console.error(err);
+        document.getElementById('loadingIndicator').style.display='none';
+        document.getElementById('errorAlert').style.display='block';
+        setAPIBadge(false, '日線更新失敗');
+      }
+    }
+
+    // 首次載入
+    initAll();
+    // 回到前景自動刷新一次（日線仍走快取不額外耗額度）
+    document.addEventListener('visibilitychange',()=>{ if(!document.hidden) refreshData(); });
+  </script>
+</body>
+</html>
