@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-  <title>TQQQ LRS 策略儀表板 (Finnhub 優化版)</title>
+  <title>TQQQ LRS 策略儀表板 (Vercel 代理版)</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
@@ -35,24 +35,20 @@
     .refresh-btn{background:rgba(255,255,255,.2);border:1px solid rgba(255,255,255,.3);color:white;padding:8px 16px;border-radius:8px;cursor:pointer;transition:all .3s ease;backdrop-filter:blur(10px);margin-left: 10px;}
     .refresh-btn:hover{background:rgba(255,255,255,.3);transform:scale(1.05)}
     .alert{background:linear-gradient(135deg,#dc2626,#991b1b);color:#fff;padding:16px;border-radius:8px;margin-bottom:20px;text-align:center;font-weight:600}
-    .badge{display:inline-block;padding:4px 8px;border-radius:999px;font-size:.8rem;margin-left:8px}
-    .badge-ok{background:#16a34a;color:white}
-    .badge-fail{background:#dc2626;color:white}
-  </style>
+    </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
-      <h1>📊 TQQQ LRS 策略儀表板 (Finnhub 優化版)</h1>
+      <h1>📊 TQQQ LRS 策略儀表板 (Vercel 代理版)</h1>
       <div class="last-updated">
         <span id="lastUpdate">載入中...</span>
-        <span id="wsHealth" class="badge">WS 檢測中</span>
         <button class="refresh-btn" onclick="refreshData()">🔄 強制更新日線</button>
       </div>
     </div>
 
     <div id="loadingIndicator" class="loading"> 正在載入市場數據 </div>
-    <div id="errorAlert" class="alert" style="display:none;">⚠️ 無法載入數據，請檢查API金鑰或網路連線</div>
+    <div id="errorAlert" class="alert" style="display:none;"></div>
 
     <div id="dashboardContent" class="dashboard" style="display:none;">
       <div class="card signal-card">
@@ -60,7 +56,6 @@
         <div id="signalStatus" class="signal-status">載入中...</div>
         <div id="signalDescription" class="signal-description">分析中...</div>
       </div>
-
       <div class="card">
         <h2 class="card-title">📈 QQQ 價格資訊</h2>
         <div class="metric"><span class="metric-label">當前價格</span><span id="qqqPrice" class="metric-value">$--</span></div>
@@ -68,7 +63,6 @@
         <div class="metric"><span class="metric-label">距離均線</span><span id="qqqDistance" class="metric-value">--%</span></div>
         <div class="metric"><span class="metric-label">日變化</span><span id="qqqChange" class="metric-value">--%</span></div>
       </div>
-
       <div class="card">
         <h2 class="card-title">🚀 TQQQ 價格資訊</h2>
         <div class="metric"><span class="metric-label">當前價格</span><span id="tqqqPrice" class="metric-value">$--</span></div>
@@ -76,16 +70,11 @@
         <div class="metric"><span class="metric-label">波動率 (20日)</span><span id="tqqqVolatility" class="metric-value">--%</span></div>
         <div class="metric"><span class="metric-label">RSI (14日)</span><span id="tqqqRsi" class="metric-value">--</span></div>
       </div>
-      
       <div class="card">
         <h2 class="card-title">⚠️ 風險指標</h2>
         <div class="metric"><span class="metric-label">VIX 代理 (VIXY)</span><span id="vixLevel" class="metric-value">--</span></div>
-        <div class="metric"><span class="metric-label">市場趨勢強度</span><span id="trendStrength" class="metric-value">--</span></div>
-        <div class="metric"><span class="metric-label">回撤風險</span><span id="drawdownRisk" class="metric-value">--</span></div>
-        <div class="metric"><span class="metric-label">信號穩定性</span><span id="signalStability" class="metric-value">--</span></div>
       </div>
     </div>
-
     <div id="chartSection" style="display:none;">
       <div class="card chart-container">
         <h2 class="card-title">📈 QQQ 價格 vs 200日均線 (近一年)</h2>
@@ -95,233 +84,57 @@
   </div>
 
 <script>
-    // ====== Finnhub 設定 ======
-    const FINNHUB_KEY = 'd2ev4n1r01qmrq4p0qlgd2ev4n1r01qmrq4p0qm0';
-    const FH_BASE = 'https://finnhub.io/api/v1';
-    const WS_URL = `wss://ws.finnhub.io?token=${FINNHUB_KEY}`;
+    // ====== Vercel 代理伺服器設定 ======
+    // 將 API 請求指向您部署成功的 Vercel 代理
+    const PROXY_BASE = 'https://finnhub-proxy-bv0mvtl2d-ryans-projects-719d79e0.vercel.app';
 
     // ====== 智能快取機制 ======
-    const LS_PREFIX = 'tqqq_fh_optimized_';
-    function cacheGet(key) {
-        try {
-            const raw = localStorage.getItem(LS_PREFIX + key);
-            if (!raw) return null;
-            const item = JSON.parse(raw);
-            if (Date.now() > item.expiry) {
-                localStorage.removeItem(LS_PREFIX + key);
-                return null;
-            }
-            return item.value;
-        } catch (e) { return null; }
-    }
-    function cacheSet(key, value, ttlMs) {
-        const item = { value: value, expiry: Date.now() + ttlMs };
-        localStorage.setItem(LS_PREFIX + key, JSON.stringify(item));
-    }
+    const LS_PREFIX = 'tqqq_proxy_';
+    function cacheGet(key) { try { const r = localStorage.getItem(LS_PREFIX + key); if (!r) return null; const i = JSON.parse(r); if (Date.now() > i.expiry) { localStorage.removeItem(LS_PREFIX + key); return null; } return i.value; } catch (e) { return null; } }
+    function cacheSet(key, value, ttlMs) { const i = { value: value, expiry: Date.now() + ttlMs }; localStorage.setItem(LS_PREFIX + key, JSON.stringify(i)); }
+    async function fetchJSON(url, cacheKey, ttlMs) { if (cacheKey) { const d = cacheGet(cacheKey); if (d) { console.log(`[Cache] Hit for ${cacheKey}`); return d; } } console.log(`[API] Fetching ${cacheKey || url}`); const r = await fetch(url); if (!r.ok) throw new Error(`HTTP Error: ${r.status}`); const j = await r.json(); if(j.error) throw new Error(j.error); if (cacheKey && ttlMs) cacheSet(cacheKey, j, ttlMs); return j; }
 
-    async function fetchJSON(url, cacheKey = null, ttlMs = 0) {
-        if (cacheKey) {
-            const cachedData = cacheGet(cacheKey);
-            if (cachedData) {
-                console.log(`[Cache] Hit for ${cacheKey}`);
-                return cachedData;
-            }
-        }
-        console.log(`[API] Fetching for ${cacheKey || url}`);
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(`HTTP Error: ${res.status}`);
-        const json = await res.json();
-        if (json.s === 'no_data') throw new Error(`No data for request: ${url}`);
-        if (cacheKey && ttlMs > 0) {
-            cacheSet(cacheKey, json, ttlMs);
-        }
-        return json;
-    }
-
-    // ====== 指標計算函式 (不變) ======
+    // ====== 指標計算函式 ======
     function computeSMA(arr, win) { if (arr.length < win) return null; return arr.slice(-win).reduce((a, b) => a + b, 0) / win; }
     function computeRSI(arr, p = 14) { if (arr.length <= p) return null; let g = 0, l = 0; for (let i = arr.length - p; i < arr.length; i++) { const d = arr[i] - arr[i - 1]; if (d >= 0) g += d; else l -= d; } const rs = l === 0 ? Infinity : g / l; return 100 - (100 / (1 + rs)); }
     function computeVol(arr, look = 20) { if (arr.length < look + 1) return null; const seg = arr.slice(-look - 1); const rets = []; for (let i = 1; i < seg.length; i++) rets.push((seg[i] - seg[i - 1]) / seg[i - 1]); const m = rets.reduce((a, b) => a + b, 0) / rets.length; const v = rets.reduce((a, b) => a + Math.pow(b - m, 2), 0) / (rets.length - 1); return Math.sqrt(v) * Math.sqrt(252) * 100; }
 
-    // ====== API 呼叫函式 ======
+    // ====== 數據獲取函式 (指向代理) ======
+    async function getQuote(symbol) {
+        const url = `${PROXY_BASE}/api/quote?symbol=${symbol}`;
+        return await fetchJSON(url);
+    }
     async function getDailyCandles(symbol, days = 300) {
         const to = Math.floor(Date.now() / 1000);
-        const from = to - days * 24 * 60 * 60; // 大約天數
-        const url = `${FH_BASE}/stock/candle?symbol=${symbol}&resolution=D&from=${from}&to=${to}&token=${FINNHUB_KEY}`;
-        // 日線數據快取 23 小時
-        const TTL = 23 * 60 * 60 * 1000;
+        const from = to - days * 24 * 60 * 60;
+        const url = `${PROXY_BASE}/api/candle?symbol=${symbol}&resolution=D&from=${from}&to=${to}`;
+        const TTL = 23 * 60 * 60 * 1000; // 快取 23 小時
         const data = await fetchJSON(url, `candle_${symbol}`, TTL);
         if (data.s !== 'ok') throw new Error(`Candle data error for ${symbol}`);
-        return {
-            dates: data.t.map(ts => new Date(ts * 1000).toISOString().slice(0, 10)),
-            closes: data.c
-        };
-    }
-    async function getQuote(symbol) {
-        const url = `${FH_BASE}/quote?symbol=${symbol}&token=${FINNHUB_KEY}`;
-        return await fetchJSON(url); // 初始報價不需要快取
+        return { dates: data.t.map(ts => new Date(ts * 1000).toISOString().slice(0, 10)), closes: data.c };
     }
 
-    // ====== WebSocket 即時報價 ======
-    let ws = null, wsReconnectTimer = null, wsBackoff = 2000;
-    const subscriptions = ['QQQ', 'TQQQ', 'VIXY'];
-    const livePrices = { QQQ: null, TQQQ: null, VIXY: null };
-    const prevClosePrices = { QQQ: null, TQQQ: null, VIXY: null };
-
-    function setWSBadge(isOk) {
-        const el = document.getElementById('wsHealth');
-        if (!el) return;
-        el.textContent = isOk ? 'WS 連線正常' : 'WS 斷線';
-        el.className = 'badge ' + (isOk ? 'badge-ok' : 'badge-fail');
-    }
-    function connectWS() {
-        if (ws && (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING)) return;
-        ws = new WebSocket(WS_URL);
-        ws.onopen = () => {
-            console.log("WebSocket connected.");
-            setWSBadge(true);
-            wsBackoff = 2000;
-            subscriptions.forEach(s => ws.send(JSON.stringify({ 'type': 'subscribe', 'symbol': s })));
-        };
-        ws.onmessage = (event) => {
-            const msg = JSON.parse(event.data);
-            if (msg.type === 'trade' && msg.data) {
-                msg.data.forEach(trade => {
-                    const symbol = trade.s;
-                    const price = trade.p;
-                    if (livePrices[symbol] !== price) {
-                        livePrices[symbol] = price;
-                        updateLiveQuoteUI(symbol, price);
-                        if (symbol === 'VIXY') {
-                            document.getElementById('vixLevel').textContent = price.toFixed(2);
-                        }
-                    }
-                });
-                document.getElementById('lastUpdate').textContent = `即時更新於: ${new Date().toLocaleTimeString('zh-TW')}`;
-            }
-        };
-        ws.onerror = () => { console.error("WebSocket error."); setWSBadge(false); };
-        ws.onclose = () => {
-            console.log("WebSocket disconnected. Attempting to reconnect...");
-            setWSBadge(false);
-            if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
-            wsReconnectTimer = setTimeout(connectWS, wsBackoff);
-            wsBackoff = Math.min(wsBackoff * 1.5, 30000);
-        };
-    }
-
-    // ====== UI 更新函式 ======
-    function updateLiveQuoteUI(symbol, price) {
-        const priceEl = document.getElementById(`${symbol.toLowerCase()}Price`);
-        const changeEl = document.getElementById(`${symbol.toLowerCase()}Change`);
-        const prevClose = prevClosePrices[symbol];
-        if (!priceEl || !changeEl || !prevClose) return;
-        
-        priceEl.textContent = '$' + price.toFixed(2);
-        const changePct = ((price - prevClose) / prevClose * 100);
-        changeEl.textContent = changePct.toFixed(2) + '%';
-        changeEl.className = 'metric-value ' + (changePct >= 0 ? 'positive' : 'negative');
-
-        // 如果是 QQQ 更新，需要重新計算策略信號
-        if (symbol === 'QQQ') {
-            updateStrategySignal();
-        }
-    }
-    
-    function updateStrategySignal() {
-        const smaEl = document.getElementById('qqqSma200');
-        const smaValue = parseFloat(smaEl.textContent.replace('$', ''));
-        const qqqPrice = livePrices.QQQ;
-        
-        if (isNaN(smaValue) || qqqPrice === null) return;
-        
-        const isAbove = qqqPrice > smaValue;
-        const distance = ((qqqPrice - smaValue) / smaValue * 100);
-
-        document.getElementById('qqqDistance').textContent = distance.toFixed(2) + '%';
-
-        const signalEl = document.getElementById('signalStatus');
-        const descEl = document.getElementById('signalDescription');
-
-        signalEl.className = 'signal-status ' + (isAbove ? 'signal-tqqq' : 'signal-cash');
-        signalEl.textContent = isAbove ? '持有 TQQQ' : '持有 現金';
-        descEl.textContent = isAbove ? 'QQQ 價格 > 200日均線' : 'QQQ 價格 ≤ 200日均線';
-    }
-
-    // ====== 主流程函式 ======
+    // ====== 主流程與 UI 更新 ======
     let chartInstance = null;
-    async function fetchAndBuildDashboard() {
+    let initialQuotes = {};
+
+    async function initialLoad() {
         try {
             document.getElementById('loadingIndicator').style.display = 'block';
-            document.getElementById('dashboardContent').style.display = 'none';
-            document.getElementById('chartSection').style.display = 'none';
             document.getElementById('errorAlert').style.display = 'none';
-            
-            // 並行獲取所有初始數據
+
+            // 1. 並行獲取所有初始數據
             const [quoteQQQ, quoteTQQQ, quoteVIXY, candlesQQQ, candlesTQQQ] = await Promise.all([
-                getQuote('QQQ'),
-                getQuote('TQQQ'),
-                getQuote('VIXY'),
-                getDailyCandles('QQQ', 300),
-                getDailyCandles('TQQQ', 300)
+                getQuote('QQQ'), getQuote('TQQQ'), getQuote('VIXY'),
+                getDailyCandles('QQQ', 300), getDailyCandles('TQQQ', 300)
             ]);
-            
-            // 儲存前日收盤價，用於計算當日變化
-            prevClosePrices.QQQ = quoteQQQ.pc;
-            prevClosePrices.TQQQ = quoteTQQQ.pc;
-            prevClosePrices.VIXY = quoteVIXY.pc;
-            
-            // 更新即時價格對象的初始值
-            livePrices.QQQ = quoteQQQ.c;
-            livePrices.TQQQ = quoteTQQQ.c;
-            livePrices.VIXY = quoteVIXY.c;
-            
-            // 計算指標
-            const qqqSma200 = computeSMA(candlesQQQ.closes, 200);
-            const tqqqVol = computeVol(candlesTQQQ.closes, 20);
-            const tqqqRsi = computeRSI(candlesTQQQ.closes, 14);
-            const isAboveSma = livePrices.QQQ > qqqSma200;
-            const vixPrice = livePrices.VIXY;
-            const distance = ((livePrices.QQQ - qqqSma200) / qqqSma200 * 100);
+            initialQuotes = { QQQ: quoteQQQ, TQQQ: quoteTQQQ, VIXY: quoteVIXY };
 
-            // 更新儀表板 UI
-            document.getElementById('qqqSma200').textContent = qqqSma200 ? '$' + qqqSma200.toFixed(2) : '--';
-            document.getElementById('tqqqVolatility').textContent = tqqqVol ? tqqqVol.toFixed(1) + '%' : '--';
-            document.getElementById('tqqqRsi').textContent = tqqqRsi ? tqqqRsi.toFixed(0) : '--';
-            
-            updateLiveQuoteUI('QQQ', livePrices.QQQ);
-            updateLiveQuoteUI('TQQQ', livePrices.TQQQ);
-            
-            // 更新風險指標
-            document.getElementById('vixLevel').textContent = vixPrice ? vixPrice.toFixed(2) : '--';
-            document.getElementById('trendStrength').textContent = Math.abs(distance) > 5 ? '強' : (Math.abs(distance) > 2 ? '中' : '弱');
-            document.getElementById('drawdownRisk').textContent = vixPrice > 25 ? '高' : (vixPrice > 18 ? '中' : '低');
-            document.getElementById('signalStability').textContent = '--'; // 暫不計算
+            // 2. 建立儀表板
+            buildDashboard(initialQuotes, { candlesQQQ, candlesTQQQ });
 
-            // 繪製圖表
-            const ctx = document.getElementById('priceChart').getContext('2d');
-            const sma200series = candlesQQQ.closes.map((_, i, arr) => {
-                if (i < 199) return null;
-                return computeSMA(arr.slice(i - 199, i + 1), 200);
-            });
-
-            if (chartInstance) chartInstance.destroy();
-            chartInstance = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: candlesQQQ.dates,
-                    datasets: [
-                        { label: 'QQQ 價格', data: candlesQQQ.closes, borderColor: '#4A5568', borderWidth: 2, tension: 0.1, pointRadius: 0 },
-                        { label: '200日均線', data: sma200series, borderColor: '#F56565', borderWidth: 2, borderDash: [5, 5], tension: 0.1, pointRadius: 0 }
-                    ]
-                },
-                options: { responsive: true, maintainAspectRatio: false, scales: { x: { ticks: { maxTicksLimit: 10 } } } }
-            });
-
-            document.getElementById('loadingIndicator').style.display = 'none';
-            document.getElementById('dashboardContent').style.display = 'grid';
-            document.getElementById('chartSection').style.display = 'block';
-            document.getElementById('lastUpdate').textContent = `日線更新於: ${new Date().toLocaleDateString()}`;
+            // 3. 設定定時器，每分鐘更新報價
+            setInterval(updateLiveQuotes, 60 * 1000);
 
         } catch (err) {
             console.error("Failed to build dashboard:", err);
@@ -331,21 +144,85 @@
         }
     }
 
-    async function init() {
-        await fetchAndBuildDashboard();
-        connectWS(); // 在儀表板建立後再連線 WebSocket
+    function buildDashboard(quotes, candles) {
+        // --- 計算指標 ---
+        const qqqSma200 = computeSMA(candles.candlesQQQ.closes, 200);
+        const tqqqVol = computeVol(candles.candlesTQQQ.closes, 20);
+        const tqqqRsi = computeRSI(candles.candlesTQQQ.closes, 14);
+
+        // --- 更新 UI ---
+        updateMetrics(quotes.QQQ, quotes.TQQQ);
+        document.getElementById('tqqqVolatility').textContent = tqqqVol ? tqqqVol.toFixed(1) + '%' : '--';
+        document.getElementById('tqqqRsi').textContent = tqqqRsi ? tqqqRsi.toFixed(0) : '--';
+        document.getElementById('vixLevel').textContent = quotes.VIXY.c ? quotes.VIXY.c.toFixed(2) : '--';
+        document.getElementById('qqqSma200').textContent = qqqSma200 ? '$' + qqqSma200.toFixed(2) : '--';
+
+        // --- 繪製圖表 ---
+        const ctx = document.getElementById('priceChart').getContext('2d');
+        const sma200series = candles.candlesQQQ.closes.map((_, i, arr) => (i < 199) ? null : computeSMA(arr.slice(i - 199, i + 1), 200));
+        if (chartInstance) chartInstance.destroy();
+        chartInstance = new Chart(ctx, { /* ... (圖表設定與之前相同) ... */
+             type: 'line', data: { labels: candles.candlesQQQ.dates, datasets: [ { label: 'QQQ 價格', data: candles.candlesQQQ.closes, borderColor: '#4A5568', borderWidth: 2, tension: 0.1, pointRadius: 0 }, { label: '200日均線', data: sma200series, borderColor: '#F56565', borderWidth: 2, borderDash: [5, 5], tension: 0.1, pointRadius: 0 } ] }, options: { responsive: true, maintainAspectRatio: false, scales: { x: { ticks: { maxTicksLimit: 10 } } } }
+        });
+
+        // --- 顯示內容 ---
+        document.getElementById('loadingIndicator').style.display = 'none';
+        document.getElementById('dashboardContent').style.display = 'grid';
+        document.getElementById('chartSection').style.display = 'block';
+    }
+
+    async function updateLiveQuotes() {
+        try {
+            const [quoteQQQ, quoteTQQQ, quoteVIXY] = await Promise.all([ getQuote('QQQ'), getQuote('TQQQ'), getQuote('VIXY') ]);
+            updateMetrics(quoteQQQ, quoteTQQQ);
+            document.getElementById('vixLevel').textContent = quoteVIXY.c ? quoteVIXY.c.toFixed(2) : '--';
+        } catch (e) {
+            console.warn("Could not update live quotes:", e.message);
+            document.getElementById('lastUpdate').textContent = `報價更新失敗`;
+        }
     }
     
-    // 手動刷新函式 (清除日線快取並重新載入)
-    async function refreshData() {
+    function updateMetrics(quoteQQQ, quoteTQQQ) {
+        const priceQQQ = quoteQQQ.c || 0;
+        const pcQQQ = quoteQQQ.pc || 0;
+        const priceTQQQ = quoteTQQQ.c || 0;
+        const pcTQQQ = quoteTQQQ.pc || 0;
+
+        const changeQQQ = pcQQQ ? ((priceQQQ - pcQQQ) / pcQQQ * 100) : 0;
+        const changeTQQQ = pcTQQQ ? ((priceTQQQ - pcTQQQ) / pcTQQQ * 100) : 0;
+        
+        document.getElementById('qqqPrice').textContent = '$' + priceQQQ.toFixed(2);
+        document.getElementById('qqqChange').textContent = changeQQQ.toFixed(2) + '%';
+        document.getElementById('qqqChange').className = 'metric-value ' + (changeQQQ >= 0 ? 'positive' : 'negative');
+        
+        document.getElementById('tqqqPrice').textContent = '$' + priceTQQQ.toFixed(2);
+        document.getElementById('tqqqChange').textContent = changeTQQQ.toFixed(2) + '%';
+        document.getElementById('tqqqChange').className = 'metric-value ' + (changeTQQQ >= 0 ? 'positive' : 'negative');
+        
+        const smaText = document.getElementById('qqqSma200').textContent;
+        if (smaText && smaText !== '--') {
+            const sma200 = parseFloat(smaText.replace('$', ''));
+            const isAbove = priceQQQ > sma200;
+            const distance = ((priceQQQ - sma200) / sma200 * 100);
+            document.getElementById('qqqDistance').textContent = distance.toFixed(2) + '%';
+            
+            const signalEl = document.getElementById('signalStatus');
+            signalEl.className = 'signal-status ' + (isAbove ? 'signal-tqqq' : 'signal-cash');
+            signalEl.textContent = isAbove ? '持有 TQQQ' : '持有 現金';
+            document.getElementById('signalDescription').textContent = isAbove ? 'QQQ 價格 > 200日均線' : 'QQQ 價格 ≤ 200日均線';
+        }
+
+        document.getElementById('lastUpdate').textContent = `報價更新於: ${new Date().toLocaleTimeString('zh-TW')}`;
+    }
+
+    function refreshData() {
         console.log("Forcing refresh, clearing candle cache...");
         localStorage.removeItem(LS_PREFIX + 'candle_QQQ');
         localStorage.removeItem(LS_PREFIX + 'candle_TQQQ');
-        await fetchAndBuildDashboard();
+        initialLoad();
     }
 
-    // 啟動程式
-    document.addEventListener('DOMContentLoaded', init);
+    document.addEventListener('DOMContentLoaded', initialLoad);
 </script>
 </body>
 </html>
