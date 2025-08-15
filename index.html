@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-  <title>TQQQ LRS 策略儀表板 (Vercel 代理版)</title>
+  <title>TQQQ LRS 策略儀表板 (混合模式)</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
@@ -40,7 +40,7 @@
 <body>
   <div class="container">
     <div class="header">
-      <h1>📊 TQQQ LRS 策略儀表板 (Vercel 代理版)</h1>
+      <h1>📊 TQQQ LRS 策略儀表板 (混合模式)</h1>
       <div class="last-updated">
         <span id="lastUpdate">載入中...</span>
         <button class="refresh-btn" onclick="refreshData()">🔄 強制更新日線</button>
@@ -61,12 +61,12 @@
         <div class="metric"><span class="metric-label">當前價格</span><span id="qqqPrice" class="metric-value">$--</span></div>
         <div class="metric"><span class="metric-label">200日均線</span><span id="qqqSma200" class="metric-value">$--</span></div>
         <div class="metric"><span class="metric-label">距離均線</span><span id="qqqDistance" class="metric-value">--%</span></div>
-        <div class="metric"><span class="metric-label">日變化</span><span id="qqqChange" class="metric-value">--%</span></div>
+        <div class="metric"><span class="metric-label">日變化 (估)</span><span id="qqqChange" class="metric-value">--%</span></div>
       </div>
       <div class="card">
         <h2 class="card-title">🚀 TQQQ 價格資訊</h2>
         <div class="metric"><span class="metric-label">當前價格</span><span id="tqqqPrice" class="metric-value">$--</span></div>
-        <div class="metric"><span class="metric-label">日變化</span><span id="tqqqChange" class="metric-value">--%</span></div>
+        <div class="metric"><span class="metric-label">日變化 (估)</span><span id="tqqqChange" class="metric-value">--%</span></div>
         <div class="metric"><span class="metric-label">波動率 (20日)</span><span id="tqqqVolatility" class="metric-value">--%</span></div>
         <div class="metric"><span class="metric-label">RSI (14日)</span><span id="tqqqRsi" class="metric-value">--</span></div>
       </div>
@@ -84,30 +84,45 @@
   </div>
 
 <script>
-    // ====== Vercel 代理伺服器設定 ======
-    // 將 API 請求指向您部署成功的 Vercel 代理
-    const PROXY_BASE = 'https://finnhub-proxy-bv0mvtl2d-ryans-projects-719d79e0.vercel.app';
+    // ====== 設定 ======
+    // 1. Finnhub Key (只用於日線數據，您的有效 Key)
+    const FINNHUB_KEY = 'd2ev4n1r01qmrq4p0qlgd2ev4n1r01qmrq4p0qm0'; 
+    const FH_BASE = 'https://finnhub.io/api/v1';
 
-    // ====== 智能快取機制 ======
-    const LS_PREFIX = 'tqqq_proxy_';
+    // 2. 您的 Google Sheet CSV 發佈連結
+    const GOOGLE_SHEET_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vQ8V55quAl_QoanV-oGAse-unDgolVOdVHpTfFUn9bCiWMbCKEPPQqakgD_Eu8z6NULuRSHwBKpnAMs/pub?output=csv';
+
+    // ====== 智能快取機制 (For Finnhub) ======
+    const LS_PREFIX = 'tqqq_hybrid_final_';
     function cacheGet(key) { try { const r = localStorage.getItem(LS_PREFIX + key); if (!r) return null; const i = JSON.parse(r); if (Date.now() > i.expiry) { localStorage.removeItem(LS_PREFIX + key); return null; } return i.value; } catch (e) { return null; } }
     function cacheSet(key, value, ttlMs) { const i = { value: value, expiry: Date.now() + ttlMs }; localStorage.setItem(LS_PREFIX + key, JSON.stringify(i)); }
-    async function fetchJSON(url, cacheKey, ttlMs) { if (cacheKey) { const d = cacheGet(cacheKey); if (d) { console.log(`[Cache] Hit for ${cacheKey}`); return d; } } console.log(`[API] Fetching ${cacheKey || url}`); const r = await fetch(url); if (!r.ok) throw new Error(`HTTP Error: ${r.status}`); const j = await r.json(); if(j.error) throw new Error(j.error); if (cacheKey && ttlMs) cacheSet(cacheKey, j, ttlMs); return j; }
+    async function fetchJSON(url, cacheKey, ttlMs) { if (cacheKey) { const d = cacheGet(cacheKey); if (d) { console.log(`[Cache] Hit for ${cacheKey}`); return d; } } console.log(`[API] Fetching ${cacheKey || url}`); const r = await fetch(url); if (!r.ok) throw new Error(`HTTP Error: ${r.status} for ${url}`); const j = await r.json(); if (j.s === 'no_data') throw new Error(`No data for ${url}`); if (cacheKey && ttlMs) cacheSet(cacheKey, j, ttlMs); return j; }
 
     // ====== 指標計算函式 ======
     function computeSMA(arr, win) { if (arr.length < win) return null; return arr.slice(-win).reduce((a, b) => a + b, 0) / win; }
     function computeRSI(arr, p = 14) { if (arr.length <= p) return null; let g = 0, l = 0; for (let i = arr.length - p; i < arr.length; i++) { const d = arr[i] - arr[i - 1]; if (d >= 0) g += d; else l -= d; } const rs = l === 0 ? Infinity : g / l; return 100 - (100 / (1 + rs)); }
     function computeVol(arr, look = 20) { if (arr.length < look + 1) return null; const seg = arr.slice(-look - 1); const rets = []; for (let i = 1; i < seg.length; i++) rets.push((seg[i] - seg[i - 1]) / seg[i - 1]); const m = rets.reduce((a, b) => a + b, 0) / rets.length; const v = rets.reduce((a, b) => a + Math.pow(b - m, 2), 0) / (rets.length - 1); return Math.sqrt(v) * Math.sqrt(252) * 100; }
 
-    // ====== 數據獲取函式 (指向代理) ======
-    async function getQuote(symbol) {
-        const url = `${PROXY_BASE}/api/quote?symbol=${symbol}`;
-        return await fetchJSON(url);
+    // ====== 數據獲取函式 ======
+    async function getQuotesFromGoogleSheet() {
+        const url = `${GOOGLE_SHEET_URL}&_=${new Date().getTime()}`; // 防止快取
+        const response = await fetch(url);
+        if (!response.ok) throw new Error('Failed to fetch from Google Sheet');
+        const csvText = await response.text();
+        const rows = csvText.trim().split(/\r?\n/);
+        const prices = {};
+        rows.forEach(row => {
+            const [symbol, price] = row.split(',');
+            if (symbol && price && !isNaN(parseFloat(price))) {
+                prices[symbol.trim()] = parseFloat(price);
+            }
+        });
+        return prices;
     }
     async function getDailyCandles(symbol, days = 300) {
         const to = Math.floor(Date.now() / 1000);
         const from = to - days * 24 * 60 * 60;
-        const url = `${PROXY_BASE}/api/candle?symbol=${symbol}&resolution=D&from=${from}&to=${to}`;
+        const url = `${FH_BASE}/stock/candle?symbol=${symbol}&resolution=D&from=${from}&to=${to}&token=${FINNHUB_KEY}`;
         const TTL = 23 * 60 * 60 * 1000; // 快取 23 小時
         const data = await fetchJSON(url, `candle_${symbol}`, TTL);
         if (data.s !== 'ok') throw new Error(`Candle data error for ${symbol}`);
@@ -116,24 +131,27 @@
 
     // ====== 主流程與 UI 更新 ======
     let chartInstance = null;
-    let initialQuotes = {};
+    let dailyData = null; // 儲存日線數據，避免重複獲取
 
     async function initialLoad() {
         try {
             document.getElementById('loadingIndicator').style.display = 'block';
             document.getElementById('errorAlert').style.display = 'none';
 
-            // 1. 並行獲取所有初始數據
-            const [quoteQQQ, quoteTQQQ, quoteVIXY, candlesQQQ, candlesTQQQ] = await Promise.all([
-                getQuote('QQQ'), getQuote('TQQQ'), getQuote('VIXY'),
-                getDailyCandles('QQQ', 300), getDailyCandles('TQQQ', 300)
+            // 1. 獲取日線數據 (有快取，消耗低)
+            const [candlesQQQ, candlesTQQQ] = await Promise.all([
+                getDailyCandles('QQQ', 300),
+                getDailyCandles('TQQQ', 300)
             ]);
-            initialQuotes = { QQQ: quoteQQQ, TQQQ: quoteTQQQ, VIXY: quoteVIXY };
+            dailyData = { candlesQQQ, candlesTQQQ }; // 儲存起來
 
-            // 2. 建立儀表板
-            buildDashboard(initialQuotes, { candlesQQQ, candlesTQQQ });
+            // 2. 獲取報價 (免費，無限制)
+            const liveQuotes = await getQuotesFromGoogleSheet();
 
-            // 3. 設定定時器，每分鐘更新報價
+            // 3. 計算並建立儀表板
+            buildDashboard(liveQuotes, dailyData);
+
+            // 4. 設定定時器，每分鐘只更新報價
             setInterval(updateLiveQuotes, 60 * 1000);
 
         } catch (err) {
@@ -146,23 +164,34 @@
 
     function buildDashboard(quotes, candles) {
         // --- 計算指標 ---
+        const prevCloseQQQ = candles.candlesQQQ.closes[candles.candlesQQQ.closes.length - 2];
+        const prevCloseTQQQ = candles.candlesTQQQ.closes[candles.candlesTQQQ.closes.length - 2];
+        
         const qqqSma200 = computeSMA(candles.candlesQQQ.closes, 200);
         const tqqqVol = computeVol(candles.candlesTQQQ.closes, 20);
         const tqqqRsi = computeRSI(candles.candlesTQQQ.closes, 14);
 
         // --- 更新 UI ---
-        updateMetrics(quotes.QQQ, quotes.TQQQ);
+        updateMetrics(quotes, prevCloseQQQ, prevCloseTQQQ, qqqSma200);
+
         document.getElementById('tqqqVolatility').textContent = tqqqVol ? tqqqVol.toFixed(1) + '%' : '--';
         document.getElementById('tqqqRsi').textContent = tqqqRsi ? tqqqRsi.toFixed(0) : '--';
-        document.getElementById('vixLevel').textContent = quotes.VIXY.c ? quotes.VIXY.c.toFixed(2) : '--';
-        document.getElementById('qqqSma200').textContent = qqqSma200 ? '$' + qqqSma200.toFixed(2) : '--';
+        document.getElementById('vixLevel').textContent = quotes.VIXY ? quotes.VIXY.toFixed(2) : '--';
 
         // --- 繪製圖表 ---
         const ctx = document.getElementById('priceChart').getContext('2d');
         const sma200series = candles.candlesQQQ.closes.map((_, i, arr) => (i < 199) ? null : computeSMA(arr.slice(i - 199, i + 1), 200));
         if (chartInstance) chartInstance.destroy();
-        chartInstance = new Chart(ctx, { /* ... (圖表設定與之前相同) ... */
-             type: 'line', data: { labels: candles.candlesQQQ.dates, datasets: [ { label: 'QQQ 價格', data: candles.candlesQQQ.closes, borderColor: '#4A5568', borderWidth: 2, tension: 0.1, pointRadius: 0 }, { label: '200日均線', data: sma200series, borderColor: '#F56565', borderWidth: 2, borderDash: [5, 5], tension: 0.1, pointRadius: 0 } ] }, options: { responsive: true, maintainAspectRatio: false, scales: { x: { ticks: { maxTicksLimit: 10 } } } }
+        chartInstance = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: candles.candlesQQQ.dates,
+                datasets: [
+                    { label: 'QQQ 價格', data: candles.candlesQQQ.closes, borderColor: '#4A5568', borderWidth: 2, tension: 0.1, pointRadius: 0 },
+                    { label: '200日均線', data: sma200series, borderColor: '#F56565', borderWidth: 2, borderDash: [5, 5], tension: 0.1, pointRadius: 0 }
+                ]
+            },
+            options: { responsive: true, maintainAspectRatio: false, scales: { x: { ticks: { maxTicksLimit: 10 } } } }
         });
 
         // --- 顯示內容 ---
@@ -173,20 +202,24 @@
 
     async function updateLiveQuotes() {
         try {
-            const [quoteQQQ, quoteTQQQ, quoteVIXY] = await Promise.all([ getQuote('QQQ'), getQuote('TQQQ'), getQuote('VIXY') ]);
-            updateMetrics(quoteQQQ, quoteTQQQ);
-            document.getElementById('vixLevel').textContent = quoteVIXY.c ? quoteVIXY.c.toFixed(2) : '--';
+            const liveQuotes = await getQuotesFromGoogleSheet();
+            const prevCloseQQQ = dailyData.candlesQQQ.closes[dailyData.candlesQQQ.closes.length - 2];
+            const prevCloseTQQQ = dailyData.candlesTQQQ.closes[dailyData.candlesTQQQ.closes.length - 2];
+            const qqqSma200 = parseFloat(document.getElementById('qqqSma200').textContent.replace('$', ''));
+            
+            updateMetrics(liveQuotes, prevCloseQQQ, prevCloseTQQQ, qqqSma200);
+            
+            document.getElementById('vixLevel').textContent = liveQuotes.VIXY ? liveQuotes.VIXY.toFixed(2) : '--';
+            
         } catch (e) {
             console.warn("Could not update live quotes:", e.message);
             document.getElementById('lastUpdate').textContent = `報價更新失敗`;
         }
     }
     
-    function updateMetrics(quoteQQQ, quoteTQQQ) {
-        const priceQQQ = quoteQQQ.c || 0;
-        const pcQQQ = quoteQQQ.pc || 0;
-        const priceTQQQ = quoteTQQQ.c || 0;
-        const pcTQQQ = quoteTQQQ.pc || 0;
+    function updateMetrics(quotes, pcQQQ, pcTQQQ, sma200) {
+        const priceQQQ = quotes.QQQ || 0;
+        const priceTQQQ = quotes.TQQQ || 0;
 
         const changeQQQ = pcQQQ ? ((priceQQQ - pcQQQ) / pcQQQ * 100) : 0;
         const changeTQQQ = pcTQQQ ? ((priceTQQQ - pcTQQQ) / pcTQQQ * 100) : 0;
@@ -198,12 +231,11 @@
         document.getElementById('tqqqPrice').textContent = '$' + priceTQQQ.toFixed(2);
         document.getElementById('tqqqChange').textContent = changeTQQQ.toFixed(2) + '%';
         document.getElementById('tqqqChange').className = 'metric-value ' + (changeTQQQ >= 0 ? 'positive' : 'negative');
-        
-        const smaText = document.getElementById('qqqSma200').textContent;
-        if (smaText && smaText !== '--') {
-            const sma200 = parseFloat(smaText.replace('$', ''));
+
+        if (sma200) {
             const isAbove = priceQQQ > sma200;
             const distance = ((priceQQQ - sma200) / sma200 * 100);
+            document.getElementById('qqqSma200').textContent = '$' + sma200.toFixed(2);
             document.getElementById('qqqDistance').textContent = distance.toFixed(2) + '%';
             
             const signalEl = document.getElementById('signalStatus');
@@ -215,6 +247,7 @@
         document.getElementById('lastUpdate').textContent = `報價更新於: ${new Date().toLocaleTimeString('zh-TW')}`;
     }
 
+    // 手動刷新函式 (清除日線快取並重新載入所有數據)
     function refreshData() {
         console.log("Forcing refresh, clearing candle cache...");
         localStorage.removeItem(LS_PREFIX + 'candle_QQQ');
@@ -222,6 +255,7 @@
         initialLoad();
     }
 
+    // 啟動程式
     document.addEventListener('DOMContentLoaded', initialLoad);
 </script>
 </body>
